@@ -1,0 +1,26 @@
+{
+    "git.autofetch": true,
+    "git.enableSmartCommit": true,
+    "git.confirmSync": false,
+    "security.allowedUNCHosts": [
+        "wsl.localhost"
+    ],
+    "terminal.integrated.allowChords": false,
+    "makefile.configureOnOpen": true,
+    "[python]": {
+        "diffEditor.ignoreTrimWhitespace": false,
+        "editor.formatOnType": true,
+        "editor.wordBasedSuggestions": "off",
+        "editor.codeActionsOnSave": {
+      "source.fixAll": "explicit",
+      "source.organizeImports": "explicit"
+    },
+    "editor.defaultFormatter": "charliermarsh.ruff"    
+    },
+    "cmake.showOptionsMovedNotification": false,
+    "git.ignoreRebaseWarning": true,
+    "remote.autoForwardPortsSource": "hybrid",
+    "jupyter.askForKernelRestart": false,
+    "editor.largeFileOptimizations": false,
+    "terminal.integrated.initialHint": false
+}
