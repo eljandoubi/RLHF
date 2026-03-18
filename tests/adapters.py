@@ -11,6 +11,7 @@ from transformers import PreTrainedTokenizerBase
 from cs336_alignment.sft import (
     compute_entropy,
     get_response_log_probs,
+    masked_normalize,
     tokenize_prompt_and_output,
 )
 
@@ -282,7 +283,7 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    raise NotImplementedError
+    return masked_normalize(tensor=tensor, mask=mask, dim=dim, normalize_constant=normalize_constant)
 
 
 """
