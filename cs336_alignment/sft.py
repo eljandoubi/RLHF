@@ -1,3 +1,5 @@
+from typing import Any, Callable
+
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
@@ -132,3 +134,150 @@ def sft_microbatch_train_step(
     loss = -masked_normalize(tensor=policy_log_probs, mask=response_mask, normalize_constant=normalize_constant*gradient_accumulation_steps, dim=1).mean() 
     loss.backward()
     return loss.detach(), {}
+
+
+@torch.inference_mode()
+def log_generations(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    prompts: list[str],
+    ground_truths: list[str],
+    reward_fn: Callable[[str, str], dict[str, float]],
+    *,
+    max_new_tokens: int = 256,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    do_sample: bool | None = None,
+    num_log: int = 8,
+    step: int | None = None,
+    stop_str: str | None = None,
+    device: torch.device | str | None = None,
+) -> dict[str, Any]:
+    """
+    Generate responses for a few prompts and log:
+      - prompt / response / ground_truth
+      - reward: format_reward, answer_reward, reward
+      - avg token entropy over generated tokens
+      - length stats (avg, correct avg, wrong avg)
+    
+    Returns a dict with:
+      - "samples": list[dict]
+      - "stats": dict
+    """
+    assert len(prompts) == len(ground_truths), "prompts and ground_truths must align"
+
+    model.eval()
+    if device is None:
+        device = next(model.parameters()).device
+
+    n = min(num_log, len(prompts))
+    prompts = prompts[:n]
+    ground_truths = ground_truths[:n]
+
+    # decide sampling
+    if do_sample is None:
+        do_sample = temperature > 0
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # batch tokenize to get attention mask
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    )
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)    
+
+    # generate in one batch
+    gen_out = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature if do_sample else None,
+        top_p=top_p if do_sample else None,
+        return_dict_in_generate=True,
+        output_scores=True,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    sequences = gen_out.sequences  # (B, T_total)
+    prompt_lens = attention_mask.sum(dim=1).tolist()
+
+    samples: list[dict[str, Any]] = []
+    lengths: list[int] = []
+    lengths_correct: list[int] = []
+    lengths_wrong: list[int] = []
+    entropies: list[float] = []
+
+    # Compute per-step entropies from scores
+    avg_ent_per_sample = [0.0 for _ in range(n)]
+    if gen_out.scores is not None and len(gen_out.scores) > 0:
+        # accumulate entropies per step per sample
+        acc = [0.0 for _ in range(n)]
+        for step_logits in gen_out.scores:
+            for i in range(n):
+                acc[i] += float(compute_entropy(step_logits[i]).item())
+        denom = float(len(gen_out.scores))
+        avg_ent_per_sample = [x / denom for x in acc]
+
+    for i in range(n):
+        prompt = prompts[i]
+        gt = ground_truths[i]
+        pl = int(prompt_lens[i])
+
+        full_ids = sequences[i]
+        gen_ids = full_ids[pl:]  # generated part
+
+        response_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+        if stop_str is not None and stop_str in response_text:
+            response_text = response_text.split(stop_str)[0] + stop_str
+
+        reward_dict = reward_fn(response_text, gt)
+
+        gen_len = int(gen_ids.numel())
+        avg_ent = float(avg_ent_per_sample[i])
+
+        samples.append(
+            {
+                "step": step,
+                "prompt": prompt,
+                "response": response_text,
+                "ground_truth": gt,
+                "reward": float(reward_dict.get("reward", 0.0)),
+                "format_reward": float(reward_dict.get("format_reward", 0.0)),
+                "answer_reward": float(reward_dict.get("answer_reward", 0.0)),
+                "avg_token_entropy": avg_ent,
+                "response_len": gen_len,
+            }
+        )
+
+        lengths.append(gen_len)
+        entropies.append(avg_ent)
+        is_correct = float(reward_dict.get("answer_reward", 0.0)) >= 1.0
+        if is_correct:
+            lengths_correct.append(gen_len)
+        else:
+            lengths_wrong.append(gen_len)
+
+    def _mean(xs: list[float]) -> float:
+        return float(sum(xs) / len(xs)) if xs else 0.0
+
+    stats = {
+        "step": step,
+        "avg_response_len": _mean([float(x) for x in lengths]),
+        "avg_response_len_correct": _mean([float(x) for x in lengths_correct]),
+        "avg_response_len_wrong": _mean([float(x) for x in lengths_wrong]),
+        "avg_token_entropy": _mean(entropies),
+        "avg_reward": _mean([s["reward"] for s in samples]),
+        "avg_format_reward": _mean([s["format_reward"] for s in samples]),
+        "avg_answer_reward": _mean([s["answer_reward"] for s in samples]),
+        "n_logged": len(samples),
+    }
+
+    return {"samples": samples, "stats": stats}
