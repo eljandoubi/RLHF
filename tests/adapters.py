@@ -10,6 +10,7 @@ from transformers import PreTrainedTokenizerBase
 
 from cs336_alignment.sft import (
     compute_entropy,
+    get_response_log_probs,
     tokenize_prompt_and_output,
 )
 
@@ -123,7 +124,12 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    raise NotImplementedError
+    return get_response_log_probs(
+        model=model,
+        input_ids=input_ids,
+        labels=labels,
+        return_token_entropy=return_token_entropy,
+    )
 
 
 def run_compute_naive_policy_gradient_loss(
