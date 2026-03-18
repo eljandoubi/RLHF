@@ -32,3 +32,22 @@ def tokenize_prompt_and_output(prompt_strs: list[str], output_strs: list[str], t
         "labels": tokenized_inputs[:, 1:].clone(),
         "response_mask": mask[:, 1:],
     }
+
+def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Get the entropy of the next-token predictions (i.e., entropy over the vocabulary dimension).
+    Args:
+    logits: torch.Tensor Tensor of shape (batch_size, sequence_length, vocab_size)
+    containing unnormalized logits.
+    Returns:
+    torch.Tensor Shape (batch_size, sequence_length). The entropy for each next-token
+    prediction."""
+    # probs = torch.nn.functional.softmax(logits, dim=-1)
+    # log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    # entropy = -torch.sum(probs * log_probs, dim=-1)
+    # return entropy
+    maxes, _ = logits.max(dim=-1, keepdim=True)
+    shift_logits = logits - maxes
+    del maxes
+    normalized_logits = shift_logits - torch.logsumexp(shift_logits, dim=-1, keepdim=True)
+    del shift_logits
+    return -(normalized_logits.exp()*normalized_logits).sum(dim=-1)
