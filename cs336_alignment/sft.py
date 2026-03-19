@@ -1,7 +1,20 @@
+from argparse import Namespace
 from typing import Any, Callable
+from unittest.mock import patch
 
 import torch
-from transformers import PreTrainedModel, PreTrainedTokenizer
+import torch.optim as optim
+from datasets import load_dataset
+from drgrpo_grader import r1_zero_reward_fn
+from evaluation import evaluate_vllm, summarize_results
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+)
+from vllm import LLM, SamplingParams
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 
 def tokenize_prompt_and_output(prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer)-> dict[str, torch.Tensor]:
@@ -281,3 +294,112 @@ def log_generations(
     }
 
     return {"samples": samples, "stats": stats}
+
+
+
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+        """
+        Start the inference process, here we use vLLM to hold a model on
+        a GPU separate from the policy.
+        13
+        """
+        vllm_set_random_seed(seed)
+        # Monkeypatch from TRL:
+        # https://github.com/huggingface/trl/blob/
+        # 22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py
+        # Patch vLLM to make sure we can
+        # (1) place the vLLM model on the desired device (world_size_patch) and
+        # (2) avoid a test that is not designed for our setting (profiling_patch).
+        world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+        profiling_patch = patch(
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        return_value=None
+        )
+        with world_size_patch, profiling_patch:
+            return LLM(
+            model=model_id,
+            device=device,
+            dtype=torch.bfloat16,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=gpu_memory_utilization,
+            )
+        
+def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
+    """
+    Copied from https://github.com/huggingface/trl/blob/
+    22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py#L670.
+    """
+    state_dict = policy.state_dict()
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(state_dict.items())
+
+def get_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
+    """
+    Return an optimizer class based on the optimizer name.
+    """
+    if optimizer_name == "adamw":
+        return optim.AdamW
+    elif optimizer_name == "sgd":
+        return optim.SGD
+    elif optimizer_name == "adagrad":
+        return optim.Adagrad
+    elif optimizer_name == "rmsprop":
+        return optim.RMSprop
+    elif optimizer_name == "adam":
+        return optim.Adam
+    elif optimizer_name == "adamax":
+        return optim.Adamax
+    elif optimizer_name == "nadam":
+        return optim.NAdam
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+def sft_training(args: Namespace):
+    """
+    Main SFT training loop. You should call the above functions from here to implement the training loop.
+    """
+    policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        args.policy_model_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    ).to(args.policy_device)
+    optimizer_cls = get_optimizer(args.optimizer)
+    optimizer: torch.optim.Optimizer = optimizer_cls(policy.parameters(), lr=args.learning_rate)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
+    ref_model = init_vllm(args.ref_model_id, device=args.vllm_device, seed=args.seed)
+    load_policy_into_vllm_instance(policy, ref_model)
+    sampling_params = SamplingParams(
+        temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
+        include_stop_str_in_output=True
+        )
+    dataset = load_dataset(args.dataset_name, split=args.dataset_split)
+    dataset.rename_column_("query", "prompt")
+    dataset = dataset.train_test_split(test_size=0.2, seed=42)
+    train_dataset = dataset["train"].shuffle(seed=args.seed)
+    eval_dataset = dataset["test"]
+    policy.train()
+    for epoch in range(args.epochs):
+        for i, samples in enumerate(train_dataset.iter(batch_size=args.train_batch_size)):
+            tokenized = tokenize_prompt_and_output(samples["prompt"], samples["response"], tokenizer)
+            input_ids = tokenized["input_ids"].to(args.policy_device)
+            labels = tokenized["labels"].to(args.policy_device)
+            response_mask = tokenized["response_mask"].to(args.policy_device)
+            policy_outputs = get_response_log_probs(policy, input_ids, labels, return_token_entropy=False)
+            loss, metadata = sft_microbatch_train_step(
+                policy_log_probs=policy_outputs["log_probs"],
+                response_mask=response_mask,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                normalize_constant=1.0,
+            )
+            if (i + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+            if (i + 1) % args.eval_step == 0:
+                eval_results = []
+                for eval_samples in eval_dataset.iter(batch_size=args.eval_batch_size):
+                    eval_results.extend(evaluate_vllm(ref_model, r1_zero_reward_fn, eval_samples, sampling_params))
+                avg_scores = summarize_results(eval_results)
+                print("Average Scores:")
+                for metric, score in avg_scores.items():
+                    print(f"  {metric}: {score:.4f}")

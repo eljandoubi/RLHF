@@ -2,7 +2,7 @@ import json
 import math
 from argparse import ArgumentParser, Namespace
 from itertools import batched
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, List
 
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
@@ -14,14 +14,14 @@ def evaluate_vllm(
     reward_fn: Callable[[str, str], Dict[str, float]],
     samples: List[Dict[str,str]],
     eval_sampling_params: SamplingParams
-    ) -> None:
+    ) -> List[Dict[str, Any]]:
     """
     Evaluate a language model on a list of prompts,
     compute evaluation metrics, and serialize results to disk.
     """ 
     with open("cs336_alignment/prompts/r1_zero.prompt") as f:
         prompt_template = f.read()
-    results = []
+    results: List[Dict[str, Any]] = []
     total = int(math.ceil(len(samples)*1.0/BATCH_SIZE))
     for batch_samples in tqdm(batched(samples,BATCH_SIZE),total=total,desc="Batch evaluate the data."):
         prompts = [prompt_template.format(question=sample["question"]) for sample in batch_samples]
@@ -32,8 +32,22 @@ def evaluate_vllm(
             scores = reward_fn(prompt,answer)
             results.append({"exemple":prompt,"generation":answer,"scores":scores})
     
-    with open('math_baseline_eval.json',"w") as f:
-        json.dump(results,f)
+    return results
+
+def summarize_results(results: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Compute average scores across all evaluated samples.
+    """
+    if not results:
+        return {}
+    
+    score_sums: Dict[str, float] = {}
+    for result in results:
+        for metric, score in result["scores"].items():
+            score_sums[metric] = score_sums.get(metric, 0.0) + score
+    
+    avg_scores = {metric: total / len(results) for metric, total in score_sums.items()}
+    return avg_scores
 
 def main(args: Namespace):
     print(args)
@@ -53,7 +67,16 @@ def main(args: Namespace):
         include_stop_str_in_output=True
         )
     
-    evaluate_vllm(llm,r1_zero_reward_fn,dataset,sampling_params)
+    results = evaluate_vllm(llm,r1_zero_reward_fn,dataset,sampling_params)
+
+    with open('math_baseline_eval.json',"w") as f:
+        json.dump(results,f)
+
+    avg_scores = summarize_results(results)
+    print("Average Scores:")
+    for metric, score in avg_scores.items():
+        print(f"  {metric}: {score:.4f}")
+
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Evaluation of the baseline on math.")
