@@ -4,10 +4,17 @@ from argparse import ArgumentParser, Namespace
 from itertools import batched
 from typing import Any, Callable, Dict, List
 
+from summable_dict import dict_mean
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
 BATCH_SIZE = 8
+
+def r1_format_response(response: str) -> str:
+    if response.count("\n#### ") < 1:
+        return f"</think> <answer>{response}</answer>"
+    thinking, answer = response.split("\n#### ")
+    return f"{thinking}</think> <answer>{answer}</answer>"
 
 def evaluate_vllm(
     vllm_model: LLM,
@@ -25,29 +32,17 @@ def evaluate_vllm(
     total = int(math.ceil(len(samples)*1.0/BATCH_SIZE))
     for batch_samples in tqdm(batched(samples,BATCH_SIZE),total=total,desc="Batch evaluate the data."):
         prompts = [prompt_template.format(question=sample["question"]) for sample in batch_samples]
+        ground_truths = [r1_format_response(sample["answer"]) for sample in batch_samples]
         responses = vllm_model.generate(prompts, eval_sampling_params,use_tqdm=False)
-        for response in responses:
+        for i, response in enumerate(responses):
             prompt = response.prompt
             answer = response.outputs[0].text
-            scores = reward_fn(prompt,answer)
-            results.append({"exemple":prompt,"generation":answer,"scores":scores})
+            scores = reward_fn(answer,ground_truths[i])
+            results.append({"exemple":prompt,
+                            "ground_truth": ground_truths[i],
+                            "generation":answer,"scores":scores})
     
     return results
-
-def summarize_results(results: List[Dict[str, Any]]) -> Dict[str, float]:
-    """
-    Compute average scores across all evaluated samples.
-    """
-    if not results:
-        return {}
-    
-    score_sums: Dict[str, float] = {}
-    for result in results:
-        for metric, score in result["scores"].items():
-            score_sums[metric] = score_sums.get(metric, 0.0) + score
-    
-    avg_scores = {metric: total / len(results) for metric, total in score_sums.items()}
-    return avg_scores
 
 def main(args: Namespace):
     print(args)
@@ -72,9 +67,9 @@ def main(args: Namespace):
     with open('math_baseline_eval.json',"w") as f:
         json.dump(results,f)
 
-    avg_scores = summarize_results(results)
+    avg_scores = dict_mean(results)
     print("Average Scores:")
-    for metric, score in avg_scores.items():
+    for metric, score in avg_scores["scores"].items():
         print(f"  {metric}: {score:.4f}")
 
 

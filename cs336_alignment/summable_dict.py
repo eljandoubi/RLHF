@@ -1,11 +1,18 @@
 class SummableDict(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for key, value in self.items():
+            if isinstance(value, dict):
+                self[key] = SummableDict(value)
+    
     def __add__(self, other: dict) -> "SummableDict":
         if not isinstance(other, dict):
             return NotImplemented
         result = SummableDict(self)
         for key, value in other.items():
             if key in result:
-                result[key] += value
+                if hasattr(result[key], "__add__"):
+                    result[key] += value
             else:
                 result[key] = value
         return result

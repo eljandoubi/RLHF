@@ -167,3 +167,4 @@ cython_debug/
 #.idea/
 *.deb
 wandb/
+math_baseline_eval.json

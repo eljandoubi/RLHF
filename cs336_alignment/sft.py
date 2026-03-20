@@ -1,6 +1,6 @@
 import argparse
 from argparse import Namespace
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from unittest.mock import patch
 
 import torch
@@ -18,7 +18,6 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.evaluation import evaluate_vllm, summarize_results
 from cs336_alignment.summable_dict import SummableDict, dict_mean
 
 
@@ -173,8 +172,10 @@ def log_generations(
     reward_fn: Callable[[str, str], dict[str, float]],
     *,
     sampling_params: SamplingParams,
-    num_log: int = 8,
+    num_log: int | None = None,
     step: int | None = None,
+    return_obejcts: Literal["samples", "stats", "both"] = "both",
+    
 ) -> dict[str, Any]:
     """
     Generate responses for a few prompts and log:
@@ -189,9 +190,10 @@ def log_generations(
     """
     assert len(prompts) == len(ground_truths), "prompts and ground_truths must align"
 
-    n = min(num_log, len(prompts))
-    prompts = prompts[:n]
-    ground_truths = ground_truths[:n]
+    if num_log is not None:
+        n = min(num_log, len(prompts))
+        prompts = prompts[:n]
+        ground_truths = ground_truths[:n]
 
     # generate responses with vLLM
     responses = model.generate(prompts, sampling_params, use_tqdm=False)
@@ -232,8 +234,12 @@ def log_generations(
                 "response_len": response_len,
             }
         )
-
-    return {"samples": samples, "stats": dict_mean(samples)}
+    if return_obejcts == "both":
+        return {"samples": samples, "stats": dict_mean(samples)}
+    if return_obejcts == "samples":
+        return {"samples": samples}
+    if return_obejcts == "stats":       
+        return {"stats": dict_mean(samples)}
 
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
@@ -292,6 +298,26 @@ def get_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
         return optim.NAdam
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+    
+def prepare_data(source:str, test_size: float = 0.2, seed: int = 42):
+    dataset = load_dataset(source)
+    if len(dataset) == 1:
+        assert "train" in dataset, "Expected dataset to have a 'train' split if it has only one split"
+        dataset = dataset["train"]
+        dataset = dataset.train_test_split(test_size=test_size, seed=seed)
+    else:
+        assert "train" in dataset and "test" in dataset, "Expected dataset with multiple splits to have 'train' and 'test' splits"
+    if "query" in dataset["test"].column_names:  
+        dataset = dataset.rename_column("query", "prompt")
+    if "answer" in dataset["test"].column_names:
+        dataset = dataset.rename_column("answer", "response")
+    if "question" in dataset["test"].column_names:
+        dataset = dataset.rename_column("question", "prompt")
+    if "solution" in dataset["test"].column_names:
+        dataset = dataset.rename_column("solution", "response")
+    dataset["train"].shuffle(seed=seed)
+    return dataset
+
 
 def sft_training(args: Namespace):
     """
@@ -305,15 +331,13 @@ def sft_training(args: Namespace):
     optimizer_cls = get_optimizer(args.optimizer)
     optimizer: torch.optim.Optimizer = optimizer_cls(policy.parameters(), lr=args.learning_rate)
     tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
-    ref_model = init_vllm(args.ref_model_id, device=args.vllm_device, seed=args.seed)
+    ref_model = init_vllm(args.ref_model_id, device=args.vllm_device, seed=args.seed, gpu_memory_utilization=args.gpu_memory_utilization)
     sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
         include_stop_str_in_output=True, logprobs=1
         )
-    dataset = load_dataset(args.dataset_name, split=args.dataset_split)
-    dataset.rename_column("query", "prompt")
-    dataset = dataset.train_test_split(test_size=0.2, seed=42)
-    train_dataset = dataset["train"].shuffle(seed=args.seed)
+    dataset = prepare_data(args.dataset_name, test_size=args.test_size, seed=args.seed)
+    train_dataset = dataset["train"]
     eval_dataset = dataset["test"]
     policy.train()
     len_train_dataset = len(train_dataset)
@@ -333,7 +357,7 @@ def sft_training(args: Namespace):
                 policy_log_probs=policy_outputs["log_probs"],
                 response_mask=response_mask,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
-                normalize_constant=1.0,
+                normalize_constant=args.normalize_constant,
             )
             mean_metadata += metadata
             counter += 1
@@ -355,8 +379,18 @@ def sft_training(args: Namespace):
                 load_policy_into_vllm_instance(policy, ref_model)
                 eval_results = []
                 for eval_samples in eval_dataset.iter(batch_size=args.eval_batch_size):
-                    eval_results.extend(evaluate_vllm(ref_model, r1_zero_reward_fn, eval_samples, sampling_params))
-                avg_scores = summarize_results(eval_results)
+                    eval_results.extend(log_generations(
+                        model=ref_model,
+                        tokenizer=tokenizer,
+                        prompts=eval_samples["prompt"],
+                        ground_truths=eval_samples["response"],
+                        reward_fn=r1_zero_reward_fn,
+                        sampling_params=sampling_params,
+                        step=step,
+                        return_obejcts="samples",
+                    )["samples"])
+                avg_scores = dict_mean(eval_results)
+                del eval_results
                 tqdm.write("Average Scores:")
                 for metric, score in avg_scores.items():
                     tqdm.write(f"  {metric}: {score:.4f}")
@@ -400,19 +434,22 @@ def main():
     argparser.add_argument("--dataset_name", type=str, default="hkust-nlp/dart-math-uniform", help="HuggingFace dataset name (e.g. 'Dahoas/rm-static')")
     argparser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use for training (e.g. 'train', 'test')")
     argparser.add_argument("--policy_device", type=str, default="cuda:0", help="Device for the policy model (e.g. 'cuda:0')")
-    argparser.add_argument("--vllm_device", type=str, default="cuda:0", help="Device for the vLLM reference model (e.g. 'cuda:1')")
+    argparser.add_argument("--vllm_device", type=str, default="cuda:1", help="Device for the vLLM reference model (e.g. 'cuda:1')")
     argparser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer")
     argparser.add_argument("--optimizer", type=str, default="adamw", help="Optimizer to use (e.g. 'adamw', 'sgd')")
-    argparser.add_argument("--train_batch_size", type=int, default=8, help="Batch size for training")
-    argparser.add_argument("--eval_batch_size", type=int, default=8, help="Batch size for evaluation")
-    argparser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    argparser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of microbatches to accumulate before each optimizer step")
-    argparser.add_argument("--metadata_wandb_log_step", type=int, default=100, help="Number of steps between logging metadata to Weights & Biases")
-    argparser.add_argument("--eval_step", type=int, default=500, help="Number of steps between evaluations")
+    argparser.add_argument("--train_batch_size", type=int, default=32, help="Batch size for training")
+    argparser.add_argument("--eval_batch_size", type=int, default=64, help="Batch size for evaluation")
+    argparser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    argparser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Number of microbatches to accumulate before each optimizer step")
+    argparser.add_argument("--metadata_wandb_log_step", type=int, default=1000, help="Number of steps between logging metadata to Weights & Biases")
+    argparser.add_argument("--eval_step", type=int, default=10000, help="Number of steps between evaluations")
     argparser.add_argument("--logging_step", type=int, default=100, help="Number of steps between logging generations")
     argparser.add_argument("--num_log", type=int, default=8, help="Number of samples to log during generation logging")
     argparser.add_argument("--output_dir", type=str, default="./sft_checkpoints", help="Directory to save checkpoints")
     argparser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    argparser.add_argument("--gpu_memory_utilization", type=float, default=0.85, help="GPU memory utilization for vLLM (between 0 and 1)")
+    argparser.add_argument("--normalize_constant", type=float, default=1.0, help="Constant for normalizing rewards")
+    argparser.add_argument("--test_size", type=float, default=0.2, help="Test size for train/test split if the dataset does not have a predefined test split")
     args = argparser.parse_args()
     wandb.login()
     wandb.init(project="cs336_sft", config=vars(args))
