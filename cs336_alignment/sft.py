@@ -17,7 +17,7 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.evaluation import evaluate_vllm, summarize_results
-from cs336_alignment.summable_dict import dict_mean
+from cs336_alignment.summable_dict import SummableDict, dict_mean
 
 
 def tokenize_prompt_and_output(prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer)-> dict[str, torch.Tensor]:
@@ -317,7 +317,9 @@ def sft_training(args: Namespace):
     len_train_dataset = len(train_dataset)
     step_per_epoch = len_train_dataset // args.train_batch_size + int(len_train_dataset % args.train_batch_size == 0)
     total_steps = step_per_epoch * args.epochs
-    progress_bar = tqdm(total=total_steps, desc="SFT Training") 
+    progress_bar = tqdm(total=total_steps, desc="SFT Training")
+    mean_metadata = SummableDict()
+    counter = 0
     for i in range(args.epochs):
         for j, samples in enumerate(train_dataset.iter(batch_size=args.train_batch_size)):
             tokenized = tokenize_prompt_and_output(samples["prompt"], samples["response"], tokenizer)
@@ -331,12 +333,20 @@ def sft_training(args: Namespace):
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 normalize_constant=1.0,
             )
+            mean_metadata += metadata
+            counter += 1
             progress_bar.set_postfix({"loss": loss.item()})
             progress_bar.update(1)
             step = i * step_per_epoch + j + 1
             if step % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
+
+            if step % args.metadata_wandb_log_step == 0:
+                mean_metadata = mean_metadata / counter
+                tqdm.write(f"Step {step} metadata: {mean_metadata}")
+                mean_metadata = SummableDict()
+                counter = 0
 
             if step % args.eval_step == 0:
                 load_policy_into_vllm_instance(policy, ref_model)

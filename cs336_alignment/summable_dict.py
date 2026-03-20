@@ -30,11 +30,3 @@ def dict_mean(list_of_dicts: list[dict]) -> SummableDict:
     mean["num_samples"] = n
     return mean
 
-if __name__ == "__main__":
-    dicts = [
-        {"a": 1.0, "b": 2.0, "c": "hello"},
-        {"a": 3.0, "b": 4.0, "c": "world"},
-        {"a": 5.0, "b": 6.0, "c": "!"}
-    ]
-    mean_dict = dict_mean(dicts)
-    print(mean_dict)
