@@ -5,8 +5,6 @@ from unittest.mock import patch
 import torch
 import torch.optim as optim
 from datasets import load_dataset
-from drgrpo_grader import r1_zero_reward_fn
-from evaluation import evaluate_vllm, summarize_results
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -16,6 +14,10 @@ from transformers import (
 )
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
+
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.evaluation import evaluate_vllm, summarize_results
+from cs336_alignment.summable_dict import dict_mean
 
 
 def tokenize_prompt_and_output(prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer)-> dict[str, torch.Tensor]:
@@ -129,7 +131,7 @@ def sft_microbatch_train_step(
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
     normalize_constant: float = 1.0,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
     """Execute a forward-and-backward pass on a microbatch.
     Args:
     policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
@@ -139,7 +141,7 @@ def sft_microbatch_train_step(
     gradient_accumulation_steps Number of microbatches per optimizer step.
     normalize_constant The constant by which to divide the sum. It is fine to leave this as 1.0.
     Returns:
-    tuple[torch.Tensor, dict[str, torch.Tensor]].
+    tuple[torch.Tensor, dict[str, float]].
     loss scalar tensor. The microbatch loss, adjusted for gradient accumulation. We return
     this so we can log it.
     metadata Dict with metadata from the underlying loss call, and any other statistics you
@@ -147,7 +149,17 @@ def sft_microbatch_train_step(
 
     loss = -masked_normalize(tensor=policy_log_probs, mask=response_mask, normalize_constant=normalize_constant*gradient_accumulation_steps, dim=1).mean() 
     loss.backward()
-    return loss.detach(), {}
+    with torch.inference_mode():
+        loss_item = loss.item()
+        resp_tokens = response_mask.to(policy_log_probs.dtype).sum().item()
+        metadata = {
+            "raw_nll": loss_item*normalize_constant*gradient_accumulation_steps,
+            "scaled_nll": loss_item*gradient_accumulation_steps,
+            "loss": loss_item,
+            "resp_tokens": resp_tokens,
+            "avg_log_prob": loss_item*normalize_constant*gradient_accumulation_steps/resp_tokens if resp_tokens > 0 else 0.0,
+        }
+    return loss.detach(), metadata
 
 
 
@@ -219,22 +231,7 @@ def log_generations(
             }
         )
 
-    def _mean(xs: list[float]) -> float:
-        return float(sum(xs) / len(xs)) if xs else 0.0
-
-    stats = {
-        "step": step,
-        "avg_response_len": _mean([s["response_len"] for s in samples]),
-        "avg_response_len_correct": _mean([s["response_len"] for s in samples if s["answer_reward"] >= 1.0]),
-        "avg_response_len_wrong": _mean([s["response_len"] for s in samples if s["answer_reward"] < 1.0]),
-        "avg_token_entropy": _mean([s["sample_entropy"] for s in samples]),
-        "avg_reward": _mean([s["reward"] for s in samples]),
-        "avg_format_reward": _mean([s["format_reward"] for s in samples]),
-        "avg_answer_reward": _mean([s["answer_reward"] for s in samples]),
-        "n_logged": len(samples),
-    }
-
-    return {"samples": samples, "stats": stats}
+    return {"samples": samples, "stats": dict_mean(samples)}
 
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
@@ -354,5 +351,31 @@ def sft_training(args: Namespace):
                 policy.save_pretrained(save_path)
                 tokenizer.save_pretrained(save_path)
                 tqdm.write(f"Saved checkpoint to {save_path}")
+
+            if step % args.logging_step == 0:
+                load_policy_into_vllm_instance(policy, ref_model)
+                log_results = log_generations(
+                    model=ref_model,
+                    tokenizer=tokenizer,
+                    prompts=samples["prompt"],
+                    ground_truths=samples["response"],
+                    reward_fn=r1_zero_reward_fn,
+                    sampling_params=sampling_params,
+                    num_log=args.num_log,
+                    step=step,
+                )
+                tqdm.write(f"Logging generations at step {step}:")
+                tqdm.write(f"Stats: {log_results['stats']}")
+                tqdm.write("Samples:")
+                for sample in log_results["samples"]:
+                    tqdm.write(f"Prompt: {sample['prompt']}")
+                    tqdm.write(f"Response: {sample['response']}")
+                    tqdm.write(f"Ground Truth: {sample['ground_truth']}")
+                    tqdm.write(f"Reward: {sample['reward']}")
+                    tqdm.write(f"Format Reward: {sample['format_reward']}")
+                    tqdm.write(f"Answer Reward: {sample['answer_reward']}")
+                    tqdm.write(f"Sample Entropy: {sample['sample_entropy']}")
+                    tqdm.write(f"Response Length: {sample['response_len']}")
+                    tqdm.write("-----")
 
             
