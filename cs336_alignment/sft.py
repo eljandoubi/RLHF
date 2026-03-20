@@ -7,6 +7,7 @@ import torch.optim as optim
 from datasets import load_dataset
 from drgrpo_grader import r1_zero_reward_fn
 from evaluation import evaluate_vllm, summarize_results
+from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -365,7 +366,7 @@ def sft_training(args: Namespace):
     ).to(args.policy_device)
     optimizer_cls = get_optimizer(args.optimizer)
     optimizer: torch.optim.Optimizer = optimizer_cls(policy.parameters(), lr=args.learning_rate)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
+    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
     ref_model = init_vllm(args.ref_model_id, device=args.vllm_device, seed=args.seed)
     load_policy_into_vllm_instance(policy, ref_model)
     sampling_params = SamplingParams(
@@ -373,13 +374,17 @@ def sft_training(args: Namespace):
         include_stop_str_in_output=True
         )
     dataset = load_dataset(args.dataset_name, split=args.dataset_split)
-    dataset.rename_column_("query", "prompt")
+    dataset.rename_column("query", "prompt")
     dataset = dataset.train_test_split(test_size=0.2, seed=42)
     train_dataset = dataset["train"].shuffle(seed=args.seed)
     eval_dataset = dataset["test"]
     policy.train()
-    for epoch in range(args.epochs):
-        for i, samples in enumerate(train_dataset.iter(batch_size=args.train_batch_size)):
+    len_train_dataset = len(train_dataset)
+    step_per_epoch = len_train_dataset // args.train_batch_size + int(len_train_dataset % args.train_batch_size == 0)
+    total_steps = step_per_epoch * args.epochs
+    progress_bar = tqdm(total=total_steps, desc="SFT Training") 
+    for i in range(args.epochs):
+        for j, samples in enumerate(train_dataset.iter(batch_size=args.train_batch_size)):
             tokenized = tokenize_prompt_and_output(samples["prompt"], samples["response"], tokenizer)
             input_ids = tokenized["input_ids"].to(args.policy_device)
             labels = tokenized["labels"].to(args.policy_device)
@@ -391,15 +396,24 @@ def sft_training(args: Namespace):
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 normalize_constant=1.0,
             )
-            if (i + 1) % args.gradient_accumulation_steps == 0:
+            progress_bar.set_postfix({"loss": loss.item()})
+            progress_bar.update(1)
+            step = i * step_per_epoch + j + 1
+            if step % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if (i + 1) % args.eval_step == 0:
+            if step % args.eval_step == 0:
                 eval_results = []
                 for eval_samples in eval_dataset.iter(batch_size=args.eval_batch_size):
                     eval_results.extend(evaluate_vllm(ref_model, r1_zero_reward_fn, eval_samples, sampling_params))
                 avg_scores = summarize_results(eval_results)
-                print("Average Scores:")
+                tqdm.write("Average Scores:")
                 for metric, score in avg_scores.items():
-                    print(f"  {metric}: {score:.4f}")
+                    tqdm.write(f"  {metric}: {score:.4f}")
+                save_path = f"{args.output_dir}/checkpoint-{step}"
+                policy.save_pretrained(save_path)
+                tokenizer.save_pretrained(save_path)
+                tqdm.write(f"Saved checkpoint to {save_path}")
+
+            
