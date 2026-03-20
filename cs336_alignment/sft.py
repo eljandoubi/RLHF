@@ -1,3 +1,4 @@
+import argparse
 from argparse import Namespace
 from typing import Any, Callable
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from transformers import (
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
+import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.evaluation import evaluate_vllm, summarize_results
 from cs336_alignment.summable_dict import SummableDict, dict_mean
@@ -345,6 +347,7 @@ def sft_training(args: Namespace):
             if step % args.metadata_wandb_log_step == 0:
                 mean_metadata = mean_metadata / counter
                 tqdm.write(f"Step {step} metadata: {mean_metadata}")
+                wandb.log({f"train/{k}": v for k, v in mean_metadata.items()}, step=step)
                 mean_metadata = SummableDict()
                 counter = 0
 
@@ -357,6 +360,7 @@ def sft_training(args: Namespace):
                 tqdm.write("Average Scores:")
                 for metric, score in avg_scores.items():
                     tqdm.write(f"  {metric}: {score:.4f}")
+                wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
                 save_path = f"{args.output_dir}/checkpoint-{step}"
                 policy.save_pretrained(save_path)
                 tokenizer.save_pretrained(save_path)
@@ -388,4 +392,31 @@ def sft_training(args: Namespace):
                     tqdm.write(f"Response Length: {sample['response_len']}")
                     tqdm.write("-----")
 
-            
+def main():
+    argparser = argparse.ArgumentParser(description="SFT Training")
+    argparser.add_argument("--policy_model_id", type=str, default="Qwen/Qwen2.5-Math-1.5B", help="HuggingFace model ID for the policy being trained")
+    argparser.add_argument("--ref_model_id", type=str, default="Qwen/Qwen2.5-Math-1.5B", help="HuggingFace model ID for the reference model used for scoring and generation during evaluation/logging")
+    argparser.add_argument("--tokenizer_id", type=str, default="Qwen/Qwen2.5-Math-1.5B", help="HuggingFace model ID for the tokenizer (often the same as policy_model_id)")
+    argparser.add_argument("--dataset_name", type=str, default="hkust-nlp/dart-math-uniform", help="HuggingFace dataset name (e.g. 'Dahoas/rm-static')")
+    argparser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use for training (e.g. 'train', 'test')")
+    argparser.add_argument("--policy_device", type=str, default="cuda:0", help="Device for the policy model (e.g. 'cuda:0')")
+    argparser.add_argument("--vllm_device", type=str, default="cuda:0", help="Device for the vLLM reference model (e.g. 'cuda:1')")
+    argparser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer")
+    argparser.add_argument("--optimizer", type=str, default="adamw", help="Optimizer to use (e.g. 'adamw', 'sgd')")
+    argparser.add_argument("--train_batch_size", type=int, default=8, help="Batch size for training")
+    argparser.add_argument("--eval_batch_size", type=int, default=8, help="Batch size for evaluation")
+    argparser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    argparser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of microbatches to accumulate before each optimizer step")
+    argparser.add_argument("--metadata_wandb_log_step", type=int, default=100, help="Number of steps between logging metadata to Weights & Biases")
+    argparser.add_argument("--eval_step", type=int, default=500, help="Number of steps between evaluations")
+    argparser.add_argument("--logging_step", type=int, default=100, help="Number of steps between logging generations")
+    argparser.add_argument("--num_log", type=int, default=8, help="Number of samples to log during generation logging")
+    argparser.add_argument("--output_dir", type=str, default="./sft_checkpoints", help="Directory to save checkpoints")
+    argparser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    args = argparser.parse_args()
+    wandb.login()
+    wandb.init(project="cs336_sft", config=vars(args))
+    sft_training(args)
+
+if __name__ == "__main__":
+    main()
