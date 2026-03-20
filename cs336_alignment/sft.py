@@ -18,6 +18,7 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.evaluation import r1_format_response
 from cs336_alignment.summable_dict import SummableDict, dict_mean
 
 
@@ -60,10 +61,7 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     Returns:
     torch.Tensor Shape (batch_size, sequence_length). The entropy for each next-token
     prediction."""
-    # probs = torch.nn.functional.softmax(logits, dim=-1)
-    # log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-    # entropy = -torch.sum(probs * log_probs, dim=-1)
-    # return entropy
+
     maxes, _ = logits.max(dim=-1, keepdim=True)
     shift_logits = logits - maxes
     del maxes
@@ -299,7 +297,17 @@ def get_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
     
-def prepare_data(source:str, test_size: float = 0.2, seed: int = 42):
+with open("cs336_alignment/prompts/r1_zero.prompt") as f:
+        PROMPT_TEMPLATE = f.read()
+    
+def format_sample(dict_sample: dict[str, str]) -> dict[str, str]:
+
+    dict_sample["prompt"] = PROMPT_TEMPLATE.format(question=dict_sample["prompt"])
+    dict_sample["response"] = r1_format_response(dict_sample["response"])
+
+    return dict_sample
+    
+def prepare_data(source:str, test_size: float = 0.2, seed: int = 42, num_proc: int = 4) -> dict[str, Any]:
     dataset = load_dataset(source)
     if len(dataset) == 1:
         assert "train" in dataset, "Expected dataset to have a 'train' split if it has only one split"
@@ -316,6 +324,7 @@ def prepare_data(source:str, test_size: float = 0.2, seed: int = 42):
     if "solution" in dataset["test"].column_names:
         dataset = dataset.rename_column("solution", "response")
     dataset["train"].shuffle(seed=seed)
+    dataset = dataset.map(format_sample, num_proc=num_proc)
     return dataset
 
 
@@ -331,12 +340,14 @@ def sft_training(args: Namespace):
     optimizer_cls = get_optimizer(args.optimizer)
     optimizer: torch.optim.Optimizer = optimizer_cls(policy.parameters(), lr=args.learning_rate)
     tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
-    ref_model = init_vllm(args.ref_model_id, device=args.vllm_device, seed=args.seed, gpu_memory_utilization=args.gpu_memory_utilization)
+    ref_model = init_vllm(args.ref_model_id, device=args.vllm_device, seed=args.seed, 
+                          gpu_memory_utilization=args.gpu_memory_utilization)
     sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"],
         include_stop_str_in_output=True, logprobs=1
         )
-    dataset = prepare_data(args.dataset_name, test_size=args.test_size, seed=args.seed)
+    dataset = prepare_data(args.dataset_name, test_size=args.test_size, seed=args.seed, 
+                           num_proc=args.num_proc)
     train_dataset = dataset["train"]
     eval_dataset = dataset["test"]
     policy.train()
@@ -450,6 +461,7 @@ def main():
     argparser.add_argument("--gpu_memory_utilization", type=float, default=0.85, help="GPU memory utilization for vLLM (between 0 and 1)")
     argparser.add_argument("--normalize_constant", type=float, default=1.0, help="Constant for normalizing rewards")
     argparser.add_argument("--test_size", type=float, default=0.2, help="Test size for train/test split if the dataset does not have a predefined test split")
+    argparser.add_argument("--num_proc", type=int, default=4, help="Number of processes to use for dataset mapping")
     args = argparser.parse_args()
     wandb.login()
     wandb.init(project="cs336_sft", config=vars(args))
