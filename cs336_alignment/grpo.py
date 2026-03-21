@@ -98,3 +98,23 @@ def compute_grpo_clip_loss(
     with torch.inference_mode():
         metadata = {"clipped": loss1 >= loss2}
     return loss, metadata
+
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+    ) -> torch.Tensor:
+    """
+    Compute the mean of tensor along a given dimension, considering only those elements where
+    mask == 1.
+    Args:
+    tensor: torch.Tensor The data to be averaged.
+    mask: torch.Tensor Same shape as tensor; positions with 1 are included in the mean.
+    dim: int | None Dimension over which to average. If None, compute the mean over all
+    masked elements.
+    Returns:
+    torch.Tensor The masked mean; shape matches tensor.mean(dim) semantics.
+    """
+    masked_sum = (tensor * mask.to(tensor.dtype)).sum(dim=dim)
+    count = mask.sum(dim=dim)
+    return masked_sum / count
