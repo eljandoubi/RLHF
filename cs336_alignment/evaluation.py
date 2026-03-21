@@ -4,9 +4,10 @@ from argparse import ArgumentParser, Namespace
 from itertools import batched
 from typing import Any, Callable, Dict, List
 
-from .summable_dict import dict_mean
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
+
+from .summable_dict import dict_mean
 
 BATCH_SIZE = 8
 
