@@ -601,7 +601,7 @@ def main():
     argparser.add_argument(
         "--eval_step",
         type=int,
-        default=100000,
+        default=1000000,
         help="Number of steps between evaluations",
     )
     argparser.add_argument(
