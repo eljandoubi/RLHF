@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 import torch
 import torch.optim as optim
-import wandb
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import (
@@ -17,6 +16,7 @@ from transformers import (
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
+import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.evaluation import r1_format_response
 from cs336_alignment.summable_dict import SummableDict, dict_mean
@@ -414,10 +414,14 @@ def sft_training(args: Namespace):
     eval_dataset = dataset["test"]
     policy.train()
     len_train_dataset = len(train_dataset)
-    step_per_epoch = len_train_dataset // args.train_batch_size + int(
-        len_train_dataset % args.train_batch_size == 0
+    train_step_per_epoch = len_train_dataset // args.train_batch_size + int(
+        len_train_dataset % args.train_batch_size > 0
     )
-    total_steps = step_per_epoch * args.epochs
+    len_eval_dataset = len(eval_dataset)
+    eval_step_per_epoch = len_eval_dataset // args.eval_batch_size + int(
+        len_eval_dataset % args.eval_batch_size > 0
+    )
+    total_steps = train_step_per_epoch * args.epochs
     progress_bar = tqdm(total=total_steps, desc="SFT Training")
     mean_metadata = SummableDict()
     counter = 0
@@ -444,7 +448,7 @@ def sft_training(args: Namespace):
             counter += 1
             progress_bar.set_postfix({"loss": loss.item()})
             progress_bar.update(1)
-            step = i * step_per_epoch + j + 1
+            step = i * train_step_per_epoch + j + 1
             if step % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), max_norm=args.max_grad_norm
@@ -462,9 +466,11 @@ def sft_training(args: Namespace):
                 counter = 0
 
             if step % args.eval_step == 0:
+                tqdm.write(f"Evaluating at step {step}...")
                 load_policy_into_vllm_instance(policy, ref_model)
                 eval_results = []
-                for eval_samples in eval_dataset.iter(batch_size=args.eval_batch_size):
+                for eval_samples in tqdm(eval_dataset.iter(batch_size=args.eval_batch_size), desc="Evaluating",
+                                         total=eval_step_per_epoch):
                     eval_results.extend(
                         log_generations(
                             model=ref_model,
@@ -589,19 +595,19 @@ def main():
     argparser.add_argument(
         "--metadata_wandb_log_step",
         type=int,
-        default=1000,
+        default=10000,
         help="Number of steps between logging metadata to Weights & Biases",
     )
     argparser.add_argument(
         "--eval_step",
         type=int,
-        default=10000,
+        default=100000,
         help="Number of steps between evaluations",
     )
     argparser.add_argument(
         "--logging_step",
         type=int,
-        default=5000,
+        default=50000,
         help="Number of steps between logging generations",
     )
     argparser.add_argument(
