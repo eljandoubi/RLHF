@@ -3,6 +3,8 @@ from typing import Callable, Literal
 
 import torch
 from sft import get_optimizer, init_vllm, prepare_data
+from summable_dict import SummableDict
+from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -251,3 +253,20 @@ def grpo_training(args: Namespace):
     train_dataset = dataset["train"]
     eval_dataset = dataset["test"]
     policy.train()
+    len_train_dataset = len(train_dataset)
+    train_step_per_epoch = len_train_dataset // args.train_batch_size + int(
+        len_train_dataset % args.train_batch_size > 0
+    )
+    len_eval_dataset = len(eval_dataset)
+    eval_step_per_epoch = len_eval_dataset // args.eval_batch_size + int(
+        len_eval_dataset % args.eval_batch_size > 0
+    )
+    total_steps = train_step_per_epoch * args.epochs
+    progress_bar = tqdm(total=total_steps, desc="SFT Training")
+    mean_metadata = SummableDict()
+    counter = 0
+    for i in range(args.epochs):
+        for j, samples in enumerate(
+            train_dataset.iter(batch_size=args.train_batch_size)
+        ):
+            pass
