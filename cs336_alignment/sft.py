@@ -46,7 +46,7 @@ def extract_final_answer(solution):
 def format_r1_zero_response(response: str) -> str:
     response = response.strip()
     final_answer = extract_final_answer(response)
-    return f"<think>\n{response}\n</think>\n\n<answer>\n{final_answer}\n</answer>"
+    return f"<think> {response} </think> <answer> {final_answer} </answer>"
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer
