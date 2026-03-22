@@ -3,6 +3,7 @@ from functools import partial
 from typing import Callable, Literal
 
 import torch
+from multiprocess import cpu_count, get_context
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -18,6 +19,15 @@ from cs336_alignment.summable_dict import SummableDict
 
 r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=False)
 
+def parallel_map(func, iterable1, iterable2, processes=None, chunksize=32):
+    processes = processes or cpu_count()
+    data = list(zip(iterable1, iterable2))
+
+    ctx = get_context("spawn")
+
+    with ctx.Pool(processes=processes) as pool:
+        return pool.starmap(func, data, chunksize)
+
 
 def compute_group_normalized_rewards(
     reward_fnn: Callable[[str, str], dict[str, float]],
@@ -26,6 +36,7 @@ def compute_group_normalized_rewards(
     group_size: int,
     advantage_eps: float,
     normalize_by_std: bool,
+    processes: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """
     Compute rewards for each group of rollout responses, normalized by the group size.
@@ -51,7 +62,7 @@ def compute_group_normalized_rewards(
     response.
     metadata your choice of other statistics to log (e.g. mean, std, max/min of rewards).
     """
-    outputs = list(map(reward_fnn, rollout_responses, repeated_ground_truths))
+    outputs = parallel_map(reward_fnn, rollout_responses, repeated_ground_truths, processes=processes)
     raw_rewards = torch.tensor([output["reward"] for output in outputs])
     format_rewards = torch.tensor([output["format_reward"] for output in outputs])
     answer_rewards = torch.tensor([output["answer_reward"] for output in outputs])

@@ -21,6 +21,7 @@ dependencies = [
     "wandb>=0.19.8",
     "xopen>=2.0.2",
     "dataset>=1.6.2",
+    "multiprocess>=0.70.19",
 ]
 
 [tool.setuptools.packages.find]
