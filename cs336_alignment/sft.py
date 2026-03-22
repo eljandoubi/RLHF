@@ -1,10 +1,12 @@
 import argparse
 from argparse import Namespace
+from functools import partial
 from typing import Any, Callable, Literal
 from unittest.mock import patch
 
 import torch
 import torch.optim as optim
+from accelerate.utils.memory import clear_device_cache
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import (
@@ -21,6 +23,7 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.summable_dict import SummableDict, dict_mean
 from cs336_alignment.utils import format_sample
 
+r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=True)
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer
@@ -195,7 +198,7 @@ def sft_microbatch_train_step(
             if resp_tokens > 0
             else 0.0,
         }
-    return loss.detach(), metadata
+    return loss, metadata
 
 
 def log_generations(
@@ -483,7 +486,9 @@ def sft_training(args: Namespace):
                 tqdm.write(f"Saved checkpoint to {save_path}")
 
             if step % args.logging_step == 0:
+                
                 load_policy_into_vllm_instance(policy, ref_model)
+                clear_device_cache(garbage_collection=True)
                 log_results = log_generations(
                     model=ref_model,
                     tokenizer=tokenizer,
