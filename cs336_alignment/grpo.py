@@ -221,22 +221,22 @@ def grpo_microbatch_train_step(
     """
     Execute a forward-and-backward pass on a microbatch.
     Args:
-    policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
-    policy being trained.
-    response_mask (batch_size, sequence_length), 1 for response tokens, 0 for
-    prompt/padding.
-    gradient_accumulation_steps Number of microbatches per optimizer step.
-    loss_type One of "no_baseline", "reinforce_with_baseline", "grpo_clip".
-    raw_rewards Needed when loss_type == "no_baseline"; shape (batch_size, 1).
-    advantages Needed when loss_type != "no_baseline"; shape (batch_size, 1).
-    old_log_probs Required for GRPO-Clip; shape (batch_size, sequence_length).
-    cliprange Clip parameter ε for GRPO-Clip.
+        policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
+        policy being trained.
+        response_mask (batch_size, sequence_length), 1 for response tokens, 0 for
+        prompt/padding.
+        gradient_accumulation_steps Number of microbatches per optimizer step.
+        loss_type One of "no_baseline", "reinforce_with_baseline", "grpo_clip".
+        raw_rewards Needed when loss_type == "no_baseline"; shape (batch_size, 1).
+        advantages Needed when loss_type != "no_baseline"; shape (batch_size, 1).
+        old_log_probs Required for GRPO-Clip; shape (batch_size, sequence_length).
+        cliprange Clip parameter ε for GRPO-Clip.
     Returns:
-    tuple[torch.Tensor, dict[str, torch.Tensor]].
-    loss scalar tensor. The microbatch loss, adjusted for gradient accumulation. We return
-    this so we can log it.
-    metadata Dict with metadata from the underlying loss call, and any other statistics you
-    might want to log.
+        tuple[torch.Tensor, dict[str, torch.Tensor]].
+        loss scalar tensor. The microbatch loss, adjusted for gradient accumulation. We return
+        this so we can log it.
+        metadata Dict with metadata from the underlying loss call, and any other statistics you
+        might want to log.
     """
     loss, metadata = compute_policy_gradient_loss(
         policy_log_probs=policy_log_probs,
@@ -250,15 +250,55 @@ def grpo_microbatch_train_step(
     loss.backward()
     return loss.detach(), metadata
 
-def get_rollout_logprobs(outputs:list[RequestOutput], device: torch.device) -> torch.Tensor:
-    rollout_logprobs = [[next(iter(pb.values())).logprob for pb in out.logprobs]
-                         for ref_gen in outputs for out in ref_gen.outputs]
+def get_rollout_logprobs(outputs:list[RequestOutput]) -> torch.Tensor:
+    rollout_logprobs = [  ([0.0 for _ in ref_gen.prompt_token_ids]
+                           +[next(iter(pb.values())).logprob 
+                                    for pb in out.logprobs])
+                         for ref_gen in outputs 
+                         for out in ref_gen.outputs]
 
     old_logprobs = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(m, device=device) for m in rollout_logprobs], 
+            [torch.tensor(m) for m in rollout_logprobs], 
             batch_first=True, padding_value=0.0
         )
     return old_logprobs
+
+def prepare_inputs(outputs:list[RequestOutput], pad_token_id: int, device: torch.device) -> dict[str, torch.Tensor]:
+
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(ref_gen.prompt_token_ids + out.token_ids) 
+             for ref_gen in outputs for out in ref_gen.outputs], 
+            batch_first=True, padding_value=pad_token_id
+        ).long().to(device)
+    
+    response_mask = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor([0]*len(ref_gen.prompt_token_ids) + [1]*len(out.token_ids)) 
+             for ref_gen in outputs for out in ref_gen.outputs],
+            batch_first=True, padding_value=0
+        ).long().to(device)
+    
+    return {
+        "input_ids": input_ids[:,:-1],
+        "response_mask": response_mask[:, 1:],
+        "labels": input_ids[:, 1:].clone(),
+    }
+
+def get_policy_log_probs(policy: PreTrainedModel, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Get per-token log probabilities from the policy for the given inputs."""
+    model_output = policy(input_ids=inputs["input_ids"])
+    logits: torch.Tensor = model_output.logits
+
+    maxes, _ = logits.max(dim=-1, keepdim=True)
+    shift_logits = logits - maxes
+    del maxes
+    normalized_logits = shift_logits - torch.logsumexp(
+        shift_logits, dim=-1, keepdim=True
+    )
+    del shift_logits
+    index = inputs["labels"].unsqueeze(-1)
+    log_probs = normalized_logits.gather(dim=-1, 
+                                         index=index)
+    return log_probs.squeeze(-1)
 
 def grpo_training(args: Namespace):
     """
@@ -362,23 +402,38 @@ def grpo_training(args: Namespace):
                 processes=args.num_proc,
             )
 
-            if args.loss_type == "grpo_clip":
-                    old_log_probs = get_rollout_logprobs(ref_outputs, device=args.policy_device)
+            if args.loss_type == "no_baseline":
+                raw_rewards = raw_rewards.to(args.policy_device)
+                advantages = None
             else:
+                raw_rewards = None
+                advantages = advantages.to(args.policy_device)
+            
+            if args.loss_type == "grpo_clip":
+                cliprange = args.cliprange
+                old_log_probs = get_rollout_logprobs(ref_outputs
+                                                     ).to(args.policy_device)
+            else:
+                cliprange = None
                 old_log_probs = None
 
+            inputs = prepare_inputs(ref_outputs, tokenizer.pad_token_id,
+                                    args.policy_device)
+            
+            policy_log_probs = get_policy_log_probs(policy, inputs)
+
             loss, metadata = grpo_microbatch_train_step(
-                policy_log_probs=   policy_log_probs,
-                response_mask=response_mask,
+                policy_log_probs=policy_log_probs,
+                response_mask=inputs["response_mask"],
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 loss_type=args.loss_type,
-                raw_rewards=raw_rewards.to(args.policy_device) if args.loss_type == "no_baseline" else None,
-                advantages=advantages.to(args.policy_device) if args.loss_type != "no_baseline" else None,
+                raw_rewards=raw_rewards,
+                advantages=advantages,
                 old_log_probs=old_log_probs,
-                cliprange=args.cliprange if args.loss_type == "grpo_clip" else None,
+                cliprange=cliprange,
             )
-            mean_metadata.update(reward_metadata)
-            mean_metadata.update(metadata)
+            metadata.update(reward_metadata)
+            mean_metadata += metadata
             counter += 1
             if counter % args.gradient_accumulation_steps == 0:
                 optimizer.step()
