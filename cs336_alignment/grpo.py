@@ -1,6 +1,14 @@
+from argparse import Namespace
 from typing import Callable, Literal
 
 import torch
+from sft import get_optimizer, init_vllm, prepare_data
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+)
 
 
 def compute_group_normalized_rewards(
@@ -211,3 +219,35 @@ def grpo_microbatch_train_step(
     loss = masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
     loss.backward()
     return loss.detach(), metadata
+
+def grpo_training(args: Namespace):
+    """
+    Main training loop for GRPO. You can structure this however you want; we suggest
+    following the general structure of the SFT training loop in sft.py, but replacing the loss
+    computation with calls to the above functions.
+    """
+    policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        args.policy_model_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    ).to(args.policy_device)
+    optimizer_cls = get_optimizer(args.optimizer)
+    optimizer: torch.optim.Optimizer = optimizer_cls(
+        policy.parameters(), lr=args.learning_rate
+    )
+    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
+    ref_model = init_vllm(
+        args.ref_model_id,
+        device=args.vllm_device,
+        seed=args.seed,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
+    dataset = prepare_data(
+        args.dataset_name,
+        test_size=args.test_size,
+        seed=args.seed,
+        num_proc=args.num_proc,
+    )
+    train_dataset = dataset["train"]
+    eval_dataset = dataset["test"]
+    policy.train()
