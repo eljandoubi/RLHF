@@ -3,6 +3,7 @@ from functools import partial
 from typing import Callable, Literal
 
 import torch
+from accelerate.utils.memory import clear_device_cache
 from multiprocess import cpu_count, get_context
 from tqdm import tqdm
 from transformers import (
@@ -14,7 +15,12 @@ from transformers import (
 from vllm import RequestOutput, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.sft import get_optimizer, init_vllm, prepare_data
+from cs336_alignment.sft import (
+    get_optimizer,
+    init_vllm,
+    load_policy_into_vllm_instance,
+    prepare_data,
+)
 from cs336_alignment.summable_dict import SummableDict
 
 r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=False)
@@ -134,7 +140,7 @@ def compute_grpo_clip_loss(
     loss2 = advantages * clipped_ratio
     loss = -torch.minimum(loss1, loss2)
     with torch.inference_mode():
-        metadata = {"clipped": loss1.detach() >= loss2.detach()}
+        metadata = {"clipped": (loss1.detach() >= loss2.detach()).float().mean()}
     return loss, metadata
 
 def compute_policy_gradient_loss(
@@ -435,10 +441,18 @@ def grpo_training(args: Namespace):
             metadata.update(reward_metadata)
             mean_metadata += metadata
             counter += 1
-            if counter % args.gradient_accumulation_steps == 0:
+            progress_bar.set_postfix({"loss": loss.item()})
+            progress_bar.update(1)
+            step = i * train_step_per_epoch + j + 1
+            counter += 1
+            if step % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
-            progress_bar.set_postfix({"loss": loss.item(),})
-            progress_bar.update(1)
+
+            if step % args.ref_sync_steps == 0:
+                load_policy_into_vllm_instance(policy, ref_model)
+                clear_device_cache(garbage_collection=True)
+
             
+
             
