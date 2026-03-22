@@ -1,4 +1,5 @@
 import argparse
+import re
 from argparse import Namespace
 from typing import Any, Callable, Literal
 from unittest.mock import patch
@@ -18,9 +19,34 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.evaluation import r1_format_response
 from cs336_alignment.summable_dict import SummableDict, dict_mean
 
+
+def extract_final_answer(solution):
+
+    # 1. boxed
+    boxed = re.findall(r'\\boxed\{([^}]*)\}', solution)
+    if boxed:
+        return boxed[-1].strip()
+
+    # 2. "answer is"
+    match = re.search(r'(final answer is|answer is)\s*[:\-]?\s*([^\n.]+)', solution.lower())
+    if match:
+        return match.group(2).strip()
+
+    # 3. last equation result
+    eq_match = re.findall(r'=\s*([-+]?\d+\.?\d*)', solution)
+    if eq_match:
+        return eq_match[-1]
+
+    # 4. fallback
+    numbers = re.findall(r'-?\d+\.?\d*', solution)
+    return numbers[-1] if numbers else ""
+
+def format_r1_zero_response(response: str) -> str:
+    response = response.strip()
+    final_answer = extract_final_answer(response)
+    return f"<tool_call>\n{response}\n</tool_call>\n\n<answer>\n{final_answer}\n</answer>"
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer
@@ -344,7 +370,7 @@ with open("cs336_alignment/prompts/r1_zero.prompt") as f:
 def format_sample(dict_sample: dict[str, str]) -> dict[str, str]:
 
     dict_sample["prompt"] = PROMPT_TEMPLATE.format(question=dict_sample["prompt"])
-    dict_sample["response"] = r1_format_response(dict_sample["response"])
+    dict_sample["response"] = format_r1_zero_response(dict_sample["response"])
 
     return dict_sample
 
