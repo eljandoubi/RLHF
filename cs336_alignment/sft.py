@@ -23,7 +23,7 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.summable_dict import SummableDict, dict_mean
 from cs336_alignment.utils import format_sample
 
-r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=True)
+r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=False)
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer

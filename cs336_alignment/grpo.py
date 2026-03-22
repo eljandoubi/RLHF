@@ -1,4 +1,5 @@
 from argparse import Namespace
+from functools import partial
 from typing import Callable, Literal
 
 import torch
@@ -11,8 +12,11 @@ from transformers import (
 )
 from vllm import SamplingParams
 
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.sft import get_optimizer, init_vllm, prepare_data
 from cs336_alignment.summable_dict import SummableDict
+
+r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=False)
 
 
 def compute_group_normalized_rewards(
@@ -49,6 +53,8 @@ def compute_group_normalized_rewards(
     """
     outputs = list(map(reward_fnn, rollout_responses, repeated_ground_truths))
     raw_rewards = torch.tensor([output["reward"] for output in outputs])
+    format_rewards = torch.tensor([output["format_reward"] for output in outputs])
+    answer_rewards = torch.tensor([output["answer_reward"] for output in outputs])
     rewards = raw_rewards.view(-1, group_size)
     mean_rewards = rewards.mean(dim=1, keepdim=True)
     if normalize_by_std:
@@ -60,7 +66,16 @@ def compute_group_normalized_rewards(
             {"mean_reward": mean_rewards.mean().item(),
              "std_reward": rewards.std().item(),
              "max_reward": rewards.max().item(),
-             "min_reward": rewards.min().item()})
+             "min_reward": rewards.min().item(),
+             "mean_format_reward": format_rewards.mean().item(),
+             "std_format_reward": format_rewards.std().item(),
+             "max_format_reward": format_rewards.max().item(),
+             "min_format_reward": format_rewards.min().item(),
+             "std_answer_reward": answer_rewards.std().item(),
+             "max_answer_reward": answer_rewards.max().item(),
+             "min_answer_reward": answer_rewards.min().item(),
+             "mean_answer_reward": answer_rewards.mean().item(),
+            })
 
 def compute_naive_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
@@ -108,7 +123,7 @@ def compute_grpo_clip_loss(
     loss2 = advantages * clipped_ratio
     loss = -torch.minimum(loss1, loss2)
     with torch.inference_mode():
-        metadata = {"clipped": loss1 >= loss2}
+        metadata = {"clipped": (loss1 >= loss2).float().mean().item()}
     return loss, metadata
 
 def compute_policy_gradient_loss(
@@ -231,6 +246,19 @@ def grpo_training(args: Namespace):
     computation with calls to the above functions.
     """
     assert args.loss_type in ["no_baseline", "reinforce_with_baseline", "grpo_clip"], f"Invalid loss type: {args.loss_type}"
+    assert args.train_batch_size % args.gradient_accumulation_steps == 0, (
+    "train_batch_size must be divisible by gradient_accumulation_steps"
+    )
+    micro_train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+    assert args.rollout_batch_size % args.group_size == 0, (
+    "rollout_batch_size must be divisible by group_size"
+    )
+    n_prompts_per_rollout_batch = args.rollout_batch_size // args.group_size
+    assert args.train_batch_size >= args.group_size, (
+    "train_batch_size must be greater than or equal to group_size"
+    )
+    n_microbatches_per_rollout_batch = args.rollout_batch_size // micro_train_batch_size
+        
     policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         args.policy_model_id,
         torch_dtype=torch.bfloat16,
@@ -280,8 +308,8 @@ def grpo_training(args: Namespace):
     eval_dataset = dataset["test"]
     policy.train()
     len_train_dataset = len(train_dataset)
-    train_step_per_epoch = len_train_dataset // args.train_batch_size + int(
-        len_train_dataset % args.train_batch_size > 0
+    train_step_per_epoch = len_train_dataset // micro_train_batch_size + int(
+        len_train_dataset % micro_train_batch_size > 0
     )
     len_eval_dataset = len(eval_dataset)
     eval_step_per_epoch = len_eval_dataset // args.eval_batch_size + int(
@@ -293,6 +321,6 @@ def grpo_training(args: Namespace):
     counter = 0
     for i in range(args.epochs):
         for j, samples in enumerate(
-            train_dataset.iter(batch_size=args.train_batch_size)
+            train_dataset.iter(batch_size=micro_train_batch_size)
         ):
             pass
