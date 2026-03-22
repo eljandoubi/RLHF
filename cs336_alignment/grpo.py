@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Literal
 
 import torch
 
@@ -99,6 +99,56 @@ def compute_grpo_clip_loss(
         metadata = {"clipped": loss1 >= loss2}
     return loss, metadata
 
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Select and compute the desired policy-gradient loss.
+    Args:
+    policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
+    policy being trained.
+    loss_type One of "no_baseline", "reinforce_with_baseline", or "grpo_clip".
+    raw_rewards Required if loss_type == "no_baseline"; shape (batch_size, 1).
+    advantages Required for "reinforce_with_baseline" and "grpo_clip"; shape
+    (batch_size, 1).
+    old_log_probs Required for "grpo_clip"; shape (batch_size, sequence_length).
+    cliprange Required for "grpo_clip"; scalar ε used for clipping.
+    Returns:
+    tuple[torch.Tensor, dict[str, torch.Tensor]].
+    loss (batch_size, sequence_length), per-token loss.
+    metadata dict, statistics from the underlying routine (e.g., clip fraction for GRPO-Clip)
+    """
+    metadata = {}
+    if loss_type == "no_baseline":
+        assert raw_rewards is not None, "raw_rewards is required for no-baseline loss"
+        loss = compute_naive_policy_gradient_loss(
+            raw_rewards_or_advantages=raw_rewards, policy_log_probs=policy_log_probs
+        )
+    elif loss_type == "reinforce_with_baseline":
+        assert advantages is not None, "advantages are required for reinforce with baseline loss"
+        loss = compute_naive_policy_gradient_loss(
+            raw_rewards_or_advantages=advantages, policy_log_probs=policy_log_probs
+        )
+    elif loss_type == "grpo_clip":
+        assert advantages is not None, "advantages are required for GRPO-Clip loss"
+        assert old_log_probs is not None, "old_log_probs are required for GRPO-Clip loss"
+        assert cliprange is not None, "cliprange is required for GRPO-Clip loss"
+        loss, metadata = compute_grpo_clip_loss(
+            advantages=advantages,
+            policy_log_probs=policy_log_probs,
+            old_log_probs=old_log_probs,
+            cliprange=cliprange,
+        )
+    else:
+        raise ValueError(f"Invalid loss_type: {loss_type}")
+
+    return loss, metadata
+
 def masked_mean(
     tensor: torch.Tensor,
     mask: torch.Tensor,
@@ -118,3 +168,46 @@ def masked_mean(
     masked_sum = (tensor * mask.to(tensor.dtype)).sum(dim=dim)
     count = mask.sum(dim=dim)
     return masked_sum / count
+
+
+def grpo_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Execute a forward-and-backward pass on a microbatch.
+    Args:
+    policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
+    policy being trained.
+    response_mask (batch_size, sequence_length), 1 for response tokens, 0 for
+    prompt/padding.
+    gradient_accumulation_steps Number of microbatches per optimizer step.
+    loss_type One of "no_baseline", "reinforce_with_baseline", "grpo_clip".
+    raw_rewards Needed when loss_type == "no_baseline"; shape (batch_size, 1).
+    advantages Needed when loss_type != "no_baseline"; shape (batch_size, 1).
+    old_log_probs Required for GRPO-Clip; shape (batch_size, sequence_length).
+    cliprange Clip parameter ε for GRPO-Clip.
+    Returns:
+    tuple[torch.Tensor, dict[str, torch.Tensor]].
+    loss scalar tensor. The microbatch loss, adjusted for gradient accumulation. We return
+    this so we can log it.
+    metadata Dict with metadata from the underlying loss call, and any other statistics you
+    might want to log.
+    """
+    loss, metadata = compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
+    loss = masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
+    loss.backward()
+    return loss.detach(), metadata
