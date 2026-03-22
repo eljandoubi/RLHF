@@ -1,3 +1,6 @@
+from tqdm import tqdm
+
+
 class SummableDict(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -31,9 +34,8 @@ class SummableDict(dict):
 def dict_mean(list_of_dicts: list[dict]) -> SummableDict:
     if not list_of_dicts:
         return SummableDict()
-    total = sum(list_of_dicts, SummableDict())
+    total = sum(tqdm(list_of_dicts, desc="Computing Mean"), SummableDict())
     n = len(list_of_dicts)
     mean = total / n
     mean["num_samples"] = n
     return mean
-
