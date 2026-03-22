@@ -9,6 +9,7 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
 )
+from vllm import SamplingParams
 
 from cs336_alignment.sft import get_optimizer, init_vllm, prepare_data
 from cs336_alignment.summable_dict import SummableDict
@@ -236,7 +237,9 @@ def grpo_training(args: Namespace):
     ).to(args.policy_device)
     optimizer_cls = get_optimizer(args.optimizer)
     optimizer: torch.optim.Optimizer = optimizer_cls(
-        policy.parameters(), lr=args.learning_rate
+        policy.parameters(), lr=args.learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95)
     )
     tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
     ref_model = init_vllm(
@@ -245,6 +248,27 @@ def grpo_training(args: Namespace):
         seed=args.seed,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
+
+    train_sampling_params = SamplingParams(
+        temperature=args.sampling_temperature,
+        max_tokens=args.sampling_max_tokens,
+        min_tokens=args.sampling_min_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+        logprobs=1,
+        n=args.group_size,
+    )
+
+    eval_sampling_params = SamplingParams(
+        temperature=args.sampling_temperature,
+        max_tokens=args.sampling_max_tokens,
+        min_tokens=args.sampling_min_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+        logprobs=1,
+    )
+
+
     dataset = prepare_data(
         args.dataset_name,
         test_size=args.test_size,
