@@ -230,6 +230,7 @@ def grpo_training(args: Namespace):
     following the general structure of the SFT training loop in sft.py, but replacing the loss
     computation with calls to the above functions.
     """
+    assert args.loss_type in ["no_baseline", "reinforce_with_baseline", "grpo_clip"], f"Invalid loss type: {args.loss_type}"
     policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         args.policy_model_id,
         torch_dtype=torch.bfloat16,
@@ -255,7 +256,7 @@ def grpo_training(args: Namespace):
         min_tokens=args.sampling_min_tokens,
         stop=["</answer>"],
         include_stop_str_in_output=True,
-        logprobs=1,
+        logprobs=1 if args.loss_type == "grpo_clip" else None,  # We need old_log_probs for GRPO-Clip loss
         n=args.group_size,
     )
 
