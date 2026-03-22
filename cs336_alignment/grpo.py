@@ -2,8 +2,6 @@ from argparse import Namespace
 from typing import Callable, Literal
 
 import torch
-from sft import get_optimizer, init_vllm, prepare_data
-from summable_dict import SummableDict
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -11,6 +9,9 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
 )
+
+from cs336_alignment.sft import get_optimizer, init_vllm, prepare_data
+from cs336_alignment.summable_dict import SummableDict
 
 
 def compute_group_normalized_rewards(

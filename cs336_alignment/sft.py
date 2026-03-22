@@ -1,5 +1,4 @@
 import argparse
-import re
 from argparse import Namespace
 from typing import Any, Callable, Literal
 from unittest.mock import patch
@@ -20,33 +19,8 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.summable_dict import SummableDict, dict_mean
+from cs336_alignment.utils import format_sample
 
-
-def extract_final_answer(solution):
-
-    # 1. boxed
-    boxed = re.findall(r'\\boxed\{([^}]*)\}', solution)
-    if boxed:
-        return boxed[-1].strip()
-
-    # 2. "answer is"
-    match = re.search(r'(final answer is|answer is)\s*[:\-]?\s*([^\n.]+)', solution.lower())
-    if match:
-        return match.group(2).strip()
-
-    # 3. last equation result
-    eq_match = re.findall(r'=\s*([-+]?\d+\.?\d*)', solution)
-    if eq_match:
-        return eq_match[-1]
-
-    # 4. fallback
-    numbers = re.findall(r'-?\d+\.?\d*', solution)
-    return numbers[-1] if numbers else ""
-
-def format_r1_zero_response(response: str) -> str:
-    response = response.strip()
-    final_answer = extract_final_answer(response)
-    return f"<think> {response} </think> <answer> {final_answer} </answer>"
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer
@@ -361,18 +335,6 @@ def get_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
         return optim.NAdam
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
-
-
-with open("cs336_alignment/prompts/r1_zero.prompt") as f:
-    PROMPT_TEMPLATE = f.read()
-
-
-def format_sample(dict_sample: dict[str, str]) -> dict[str, str]:
-
-    dict_sample["prompt"] = PROMPT_TEMPLATE.format(question=dict_sample["prompt"])
-    dict_sample["response"] = format_r1_zero_response(dict_sample["response"])
-
-    return dict_sample
 
 
 def prepare_data(
