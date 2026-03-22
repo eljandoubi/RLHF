@@ -168,3 +168,4 @@ cython_debug/
 *.deb
 wandb/
 math_baseline_eval.json
+*/tmp.py

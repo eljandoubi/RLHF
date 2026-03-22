@@ -11,7 +11,7 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
 )
-from vllm import SamplingParams
+from vllm import RequestOutput, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.sft import get_optimizer, init_vllm, prepare_data
@@ -53,11 +53,11 @@ def compute_group_normalized_rewards(
     advantage_eps: float Small constant to avoid division by zero in normalization.
     normalize_by_std: bool If True, divide by the per-group standard deviation; otherwise
     subtract only the group mean.
+    processes: int | None Number of processes to use for parallelization. If None, defaults to the number of CPU cores.
     Returns:
     tuple[torch.Tensor, torch.Tensor, dict[str, float]].
     advantages shape (rollout_batch_size,). Group-normalized rewards for each rollout
     response.
-    22
     raw_rewards shape (rollout_batch_size,). Unnormalized rewards for each rollout
     response.
     metadata your choice of other statistics to log (e.g. mean, std, max/min of rewards).
@@ -134,7 +134,7 @@ def compute_grpo_clip_loss(
     loss2 = advantages * clipped_ratio
     loss = -torch.minimum(loss1, loss2)
     with torch.inference_mode():
-        metadata = {"clipped": (loss1 >= loss2).float().mean().item()}
+        metadata = {"clipped": loss1.detach() >= loss2.detach()}
     return loss, metadata
 
 def compute_policy_gradient_loss(
@@ -250,6 +250,16 @@ def grpo_microbatch_train_step(
     loss.backward()
     return loss.detach(), metadata
 
+def get_rollout_logprobs(outputs:list[RequestOutput], device: torch.device) -> torch.Tensor:
+    rollout_logprobs = [[next(iter(pb.values())).logprob for pb in out.logprobs]
+                         for ref_gen in outputs for out in ref_gen.outputs]
+
+    old_logprobs = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(m, device=device) for m in rollout_logprobs], 
+            batch_first=True, padding_value=0.0
+        )
+    return old_logprobs
+
 def grpo_training(args: Namespace):
     """
     Main training loop for GRPO. You can structure this however you want; we suggest
@@ -261,15 +271,14 @@ def grpo_training(args: Namespace):
     "train_batch_size must be divisible by gradient_accumulation_steps"
     )
     micro_train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
-    assert args.rollout_batch_size % args.group_size == 0, (
-    "rollout_batch_size must be divisible by group_size"
+    assert args.train_batch_size % args.group_size == 0, (
+    "train_batch_size must be divisible by group_size"
     )
-    n_prompts_per_rollout_batch = args.rollout_batch_size // args.group_size
+    n_prompts_per_rollout_batch = args.train_batch_size // args.group_size
     assert args.train_batch_size >= args.group_size, (
     "train_batch_size must be greater than or equal to group_size"
     )
-    n_microbatches_per_rollout_batch = args.rollout_batch_size // micro_train_batch_size
-        
+
     policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         args.policy_model_id,
         torch_dtype=torch.bfloat16,
@@ -327,11 +336,54 @@ def grpo_training(args: Namespace):
         len_eval_dataset % args.eval_batch_size > 0
     )
     total_steps = train_step_per_epoch * args.epochs
-    progress_bar = tqdm(total=total_steps, desc="SFT Training")
+    progress_bar = tqdm(total=total_steps, desc="GRPO Training")
     mean_metadata = SummableDict()
     counter = 0
     for i in range(args.epochs):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=micro_train_batch_size)
         ):
-            pass
+            prompts:list[str] = samples["question"]
+            ground_truths:list[str] = samples["answer"]
+            repeated_ground_truths = [gt for gt in ground_truths for _ in range(args.group_size)]
+            ref_outputs = ref_model.generate(
+                prompts,
+                sampling_params=train_sampling_params,
+                use_tqdm=False,
+            )
+            rollout_responses = [out.text for ref_gen in ref_outputs for out in ref_gen.outputs]
+            advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
+                reward_fnn=r1_zero_reward_fn,
+                rollout_responses=rollout_responses,
+                repeated_ground_truths=repeated_ground_truths,
+                group_size=args.group_size,
+                advantage_eps=args.advantage_eps,
+                normalize_by_std=args.normalize_by_std,
+                processes=args.num_proc,
+            )
+
+            if args.loss_type == "grpo_clip":
+                    old_log_probs = get_rollout_logprobs(ref_outputs, device=args.policy_device)
+            else:
+                old_log_probs = None
+
+            loss, metadata = grpo_microbatch_train_step(
+                policy_log_probs=   policy_log_probs,
+                response_mask=response_mask,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                loss_type=args.loss_type,
+                raw_rewards=raw_rewards.to(args.policy_device) if args.loss_type == "no_baseline" else None,
+                advantages=advantages.to(args.policy_device) if args.loss_type != "no_baseline" else None,
+                old_log_probs=old_log_probs,
+                cliprange=args.cliprange if args.loss_type == "grpo_clip" else None,
+            )
+            mean_metadata.update(reward_metadata)
+            mean_metadata.update(metadata)
+            counter += 1
+            if counter % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+            progress_bar.set_postfix({"loss": loss.item(),})
+            progress_bar.update(1)
+            
+            
