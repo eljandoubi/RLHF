@@ -14,11 +14,13 @@ from transformers import (
 )
 from vllm import RequestOutput, SamplingParams
 
+import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.sft import (
     get_optimizer,
     init_vllm,
     load_policy_into_vllm_instance,
+    log_generations,
     prepare_data,
 )
 from cs336_alignment.summable_dict import SummableDict
@@ -389,6 +391,34 @@ def grpo_training(args: Namespace):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=micro_train_batch_size)
         ):
+            step = i * train_step_per_epoch + j + 1
+
+            if (step-1) % args.eval_step == 0:
+                tqdm.write(f"Evaluating at step {step}...")
+                clear_device_cache(garbage_collection=True)
+                avg_scores =  SummableDict()
+                for eval_samples in tqdm(eval_dataset.iter(batch_size=args.eval_batch_size), desc="Evaluating",
+                                         total=eval_step_per_epoch):
+                    avg_scores += log_generations(
+                            model=ref_model,
+                            prompts=eval_samples["prompt"],
+                            ground_truths=eval_samples["response"],
+                            reward_fn=r1_zero_reward_fn,
+                            sampling_params=eval_sampling_params,
+                            return_obejcts="only_sum",
+                        )["only_sum"]
+
+                num_samples = avg_scores.pop("num_samples", 1)
+                avg_scores = avg_scores / num_samples
+                tqdm.write("Average Scores:")
+                for metric, score in avg_scores.items():
+                    tqdm.write(f"  {metric}: {score:.4f}")
+                wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
+                if step>1:
+                    save_path = f"{args.output_dir}/checkpoint-{step}"
+                    policy.save_pretrained(save_path)
+                    tqdm.write(f"Saved checkpoint to {save_path}")
+
             prompts:list[str] = samples["question"]
             ground_truths:list[str] = samples["answer"]
             repeated_ground_truths = [gt for gt in ground_truths for _ in range(args.group_size)]
@@ -443,9 +473,12 @@ def grpo_training(args: Namespace):
             counter += 1
             progress_bar.set_postfix({"loss": loss.item()})
             progress_bar.update(1)
-            step = i * train_step_per_epoch + j + 1
+            
             counter += 1
             if step % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), max_norm=args.max_grad_norm
+                )
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -453,6 +486,39 @@ def grpo_training(args: Namespace):
                 load_policy_into_vllm_instance(policy, ref_model)
                 clear_device_cache(garbage_collection=True)
 
+            if step % args.metadata_wandb_log_step == 0:
+                clear_device_cache(garbage_collection=True)
+                mean_metadata = mean_metadata / counter
+                tqdm.write(f"Step {step} metadata: {mean_metadata}")
+                wandb.log(
+                    {f"train/{k}": v for k, v in mean_metadata.items()}, step=step
+                )
+                mean_metadata = SummableDict()
+                counter = 0
+
+            if step % args.logging_step == 0:
+                clear_device_cache(garbage_collection=True)
+                log_results = log_generations(
+                    model=ref_model,
+                    prompts=samples["prompt"],
+                    ground_truths=samples["response"],
+                    reward_fn=r1_zero_reward_fn,
+                    sampling_params=eval_sampling_params,
+                    num_log=args.num_log,
+                )
+                tqdm.write(f"Logging generations at step {step}:")
+                tqdm.write(f"Stats: {log_results['stats']}")
+                tqdm.write("Samples:")
+                for sample in log_results["samples"]:
+                    tqdm.write(f"Prompt: {sample['prompt']}")
+                    tqdm.write(f"Response: {sample['response']}")
+                    tqdm.write(f"Ground Truth: {sample['ground_truth']}")
+                    tqdm.write(f"Reward: {sample['reward']}")
+                    tqdm.write(f"Format Reward: {sample['format_reward']}")
+                    tqdm.write(f"Answer Reward: {sample['answer_reward']}")
+                    tqdm.write(f"Sample Entropy: {sample['sample_entropy']}")
+                    tqdm.write(f"Response Length: {sample['response_len']}")
+                    tqdm.write("-----")
             
 
             
