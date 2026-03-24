@@ -203,15 +203,13 @@ def sft_microbatch_train_step(
 
 def log_generations(
     model: LLM,
-    tokenizer: PreTrainedTokenizer,
     prompts: list[str],
     ground_truths: list[str],
     reward_fn: Callable[[str, str], dict[str, float]],
     *,
     sampling_params: SamplingParams,
     num_log: int | None = None,
-    step: int | None = None,
-    return_obejcts: Literal["samples", "stats", "both"] = "both",
+    return_obejcts: Literal["samples", "stats", "both","only_sum"] = "both",
 ) -> dict[str, Any]:
     """
     Generate responses for a few prompts and log:
@@ -235,21 +233,15 @@ def log_generations(
     responses = model.generate(prompts, sampling_params, use_tqdm=False)
 
     samples: list[dict[str, Any]] = []
-    stop_str = sampling_params.stop[0] if sampling_params.stop else None
+    
     for i, response in enumerate(responses):
         prompt = prompts[i]
         gt = ground_truths[i]
         response_text = response.outputs[0].text
 
-        if stop_str is not None and stop_str in response_text:
-            response_text = response_text.split(stop_str)[0] + stop_str
-
         reward_dict = reward_fn(response_text, gt)
 
-        if tokenizer is not None:
-            response_len = len(tokenizer(response_text).input_ids)
-        else:
-            response_len = len(response_text.split())
+        response_len = len(response.outputs[0].token_ids)
 
         logprobs = response.outputs[0].logprobs
         if logprobs is not None:
@@ -257,25 +249,30 @@ def log_generations(
         else:
             smp_ent = 0.0
 
-        samples.append(
-            {
-                "step": step,
-                "prompt": prompt,
-                "response": response_text,
-                "ground_truth": gt,
+        sample =             {
+
                 "reward": reward_dict.get("reward", 0.0),
                 "format_reward": reward_dict.get("format_reward", 0.0),
                 "answer_reward": reward_dict.get("answer_reward", 0.0),
                 "sample_entropy": smp_ent,
                 "response_len": response_len,
             }
-        )
+        
+        if return_obejcts in ["samples", "both"]:
+            sample["prompt"] = prompt
+            sample["response"] = response_text
+            sample["ground_truth"] = gt
+
+        samples.append(sample)
+
     if return_obejcts == "both":
         return {"samples": samples, "stats": dict_mean(samples)}
     if return_obejcts == "samples":
         return {"samples": samples}
     if return_obejcts == "stats":
         return {"stats": dict_mean(samples)}
+    if return_obejcts == "only_sum":
+        return {"only_sum": dict_mean(samples, only_sum=True)}
 
 
 def init_vllm(
@@ -420,6 +417,35 @@ def sft_training(args: Namespace):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=args.train_batch_size)
         ):
+            step = i * train_step_per_epoch + j + 1
+
+            if (step-1) % args.eval_step == 0:
+                tqdm.write(f"Evaluating at step {step}...")
+                load_policy_into_vllm_instance(policy, ref_model)
+                avg_scores =  SummableDict()
+                for eval_samples in tqdm(eval_dataset.iter(batch_size=args.eval_batch_size), desc="Evaluating",
+                                         total=eval_step_per_epoch):
+                    avg_scores += log_generations(
+                            model=ref_model,
+                            prompts=eval_samples["prompt"],
+                            ground_truths=eval_samples["response"],
+                            reward_fn=r1_zero_reward_fn,
+                            sampling_params=sampling_params,
+                            return_obejcts="only_sum",
+                        )["only_sum"]
+
+                num_samples = avg_scores.pop("num_samples", 1)
+                avg_scores = avg_scores / num_samples
+                tqdm.write("Average Scores:")
+                for metric, score in avg_scores.items():
+                    tqdm.write(f"  {metric}: {score:.4f}")
+                wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
+                if step>1:
+                    save_path = f"{args.output_dir}/checkpoint-{step}"
+                    policy.save_pretrained(save_path)
+                    tokenizer.save_pretrained(save_path)
+                    tqdm.write(f"Saved checkpoint to {save_path}")
+
             tokenized = tokenize_prompt_and_output(
                 samples["prompt"], samples["response"], tokenizer
             )
@@ -439,7 +465,7 @@ def sft_training(args: Namespace):
             counter += 1
             progress_bar.set_postfix({"loss": loss.item()})
             progress_bar.update(1)
-            step = i * train_step_per_epoch + j + 1
+            
             if step % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), max_norm=args.max_grad_norm
@@ -456,48 +482,17 @@ def sft_training(args: Namespace):
                 mean_metadata = SummableDict()
                 counter = 0
 
-            if step % args.eval_step == 0:
-                tqdm.write(f"Evaluating at step {step}...")
-                load_policy_into_vllm_instance(policy, ref_model)
-                eval_results = []
-                for eval_samples in tqdm(eval_dataset.iter(batch_size=args.eval_batch_size), desc="Evaluating",
-                                         total=eval_step_per_epoch):
-                    eval_results.extend(
-                        log_generations(
-                            model=ref_model,
-                            tokenizer=tokenizer,
-                            prompts=eval_samples["prompt"],
-                            ground_truths=eval_samples["response"],
-                            reward_fn=r1_zero_reward_fn,
-                            sampling_params=sampling_params,
-                            step=step,
-                            return_obejcts="samples",
-                        )["samples"]
-                    )
-                avg_scores = dict_mean(eval_results)
-                del eval_results
-                tqdm.write("Average Scores:")
-                for metric, score in avg_scores.items():
-                    tqdm.write(f"  {metric}: {score:.4f}")
-                wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
-                save_path = f"{args.output_dir}/checkpoint-{step}"
-                policy.save_pretrained(save_path)
-                tokenizer.save_pretrained(save_path)
-                tqdm.write(f"Saved checkpoint to {save_path}")
-
             if step % args.logging_step == 0:
                 
                 load_policy_into_vllm_instance(policy, ref_model)
                 clear_device_cache(garbage_collection=True)
                 log_results = log_generations(
                     model=ref_model,
-                    tokenizer=tokenizer,
                     prompts=samples["prompt"],
                     ground_truths=samples["response"],
                     reward_fn=r1_zero_reward_fn,
                     sampling_params=sampling_params,
                     num_log=args.num_log,
-                    step=step,
                 )
                 tqdm.write(f"Logging generations at step {step}:")
                 tqdm.write(f"Stats: {log_results['stats']}")
@@ -571,10 +566,10 @@ def main():
         help="Optimizer to use (e.g. 'adamw', 'sgd')",
     )
     argparser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size for training"
+        "--train_batch_size", type=int, default=2, help="Batch size for training"
     )
     argparser.add_argument(
-        "--eval_batch_size", type=int, default=64, help="Batch size for evaluation"
+        "--eval_batch_size", type=int, default=256, help="Batch size for evaluation"
     )
     argparser.add_argument(
         "--epochs", type=int, default=10, help="Number of training epochs"
@@ -582,7 +577,7 @@ def main():
     argparser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=16,
+        default=128,
         help="Number of microbatches to accumulate before each optimizer step",
     )
     argparser.add_argument(
@@ -594,7 +589,7 @@ def main():
     argparser.add_argument(
         "--eval_step",
         type=int,
-        default=1000000,
+        default=200000,
         help="Number of steps between evaluations",
     )
     argparser.add_argument(

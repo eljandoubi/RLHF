@@ -169,3 +169,4 @@ cython_debug/
 wandb/
 math_baseline_eval.json
 */tmp.py
+sft_checkpoints/
