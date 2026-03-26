@@ -291,12 +291,17 @@ def prepare_inputs(outputs:list[RequestOutput], pad_token_id: int, device: torch
         "labels": input_ids[:, 1:].clone(),
     }
 
-def get_policy_log_probs(policy: PreTrainedModel, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+def get_policy_log_probs(policy: PreTrainedModel, inputs: dict[str, torch.Tensor], micro_batch_size: int) -> torch.Tensor:
     """Get per-token log probabilities from the policy for the given inputs."""
-    model_output = policy(input_ids=inputs["input_ids"])
-    logits: torch.Tensor = model_output.logits
+    input_ids = inputs["input_ids"]
+    logits_list: list[torch.Tensor] = []
+    for i in range(0, input_ids.size(0), micro_batch_size):
+        model_output = policy(input_ids=input_ids[i:i+micro_batch_size])
+        logits_list.append(model_output.logits)
+    logits = torch.cat(logits_list, dim=0)
 
-    maxes, _ = logits.max(dim=-1, keepdim=True)
+    maxes, ids = logits.max(dim=-1, keepdim=True)
+    del ids
     shift_logits = logits - maxes
     del maxes
     normalized_logits = shift_logits - torch.logsumexp(
@@ -363,7 +368,6 @@ def grpo_training(args: Namespace):
         include_stop_str_in_output=True,
         logprobs=1,
     )
-
 
     dataset = prepare_data(
         args.dataset_name,
