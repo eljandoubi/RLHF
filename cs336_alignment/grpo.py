@@ -1,4 +1,4 @@
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from functools import partial
 from typing import Callable, Literal
 
@@ -521,4 +521,145 @@ def grpo_training(args: Namespace):
                     tqdm.write("-----")
             
 
-            
+def main():
+    argparser = ArgumentParser(description="GRPO Training")
+    argparser.add_argument(
+        "--policy_model_id",
+        type=str,
+        default="Qwen/Qwen2.5-Math-1.5B",
+        help="HuggingFace model ID for the policy being trained",
+    )
+    argparser.add_argument(
+        "--ref_model_id",
+        type=str,
+        default="Qwen/Qwen2.5-Math-1.5B",
+        help="HuggingFace model ID for the reference model used for scoring and generation during evaluation/logging",
+    )
+    argparser.add_argument(
+        "--tokenizer_id",
+        type=str,
+        default="Qwen/Qwen2.5-Math-1.5B",
+        help="HuggingFace model ID for the tokenizer (often the same as policy_model_id)",
+    )
+    argparser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="hkust-nlp/dart-math-uniform",
+        help="HuggingFace dataset name (e.g. 'Dahoas/rm-static')",
+    )
+    argparser.add_argument(
+        "--dataset_split",
+        type=str,
+        default="train",
+        help="Dataset split to use for training (e.g. 'train', 'test')",
+    )
+    argparser.add_argument(
+        "--policy_device",
+        type=str,
+        default="cuda:0",
+        help="Device for the policy model (e.g. 'cuda:0')",
+    )
+    argparser.add_argument(
+        "--vllm_device",
+        type=str,
+        default="cuda:1",
+        help="Device for the vLLM reference model (e.g. 'cuda:1')",
+    )
+    argparser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-5,
+        help="Learning rate for the optimizer",
+    )
+    argparser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        help="Optimizer to use (e.g. 'adamw', 'sgd')",
+    )
+    argparser.add_argument(
+        "--train_batch_size", type=int, default=256, help="Batch size for training"
+    )
+    argparser.add_argument(
+        "--eval_batch_size", type=int, default=256, help="Batch size for evaluation"
+    )
+    argparser.add_argument(
+        "--epochs", type=int, default=10, help="Number of training epochs"
+    )
+    argparser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=128,
+        help="Number of microbatches to accumulate before each optimizer step",
+    )
+    argparser.add_argument(
+        "--metadata_wandb_log_step",
+        type=int,
+        default=10000,
+        help="Number of steps between logging metadata to Weights & Biases",
+    )
+    argparser.add_argument(
+        "--eval_step",
+        type=int,
+        default=200000,
+        help="Number of steps between evaluations",
+    )
+    argparser.add_argument(
+        "--logging_step",
+        type=int,
+        default=50000,
+        help="Number of steps between logging generations",
+    )
+    argparser.add_argument(
+        "--num_log",
+        type=int,
+        default=8,
+        help="Number of samples to log during generation logging",
+    )
+    argparser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./sft_checkpoints",
+        help="Directory to save checkpoints",
+    )
+    argparser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    argparser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.85,
+        help="GPU memory utilization for vLLM (between 0 and 1)",
+    )
+    argparser.add_argument(
+        "--normalize_constant",
+        type=float,
+        default=1.0,
+        help="Constant for normalizing rewards",
+    )
+    argparser.add_argument(
+        "--test_size",
+        type=float,
+        default=0.2,
+        help="Test size for train/test split if the dataset does not have a predefined test split",
+    )
+    argparser.add_argument(
+        "--num_proc",
+        type=int,
+        default=24,
+        help="Number of processes to use for dataset mapping",
+    )
+    argparser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for clipping",
+    )
+    args = argparser.parse_args()
+    wandb.login()
+    wandb.init(project="cs336_sft", config=vars(args))
+    grpo_training(args)
+
+
+if __name__ == "__main__":
+    main()
