@@ -428,8 +428,8 @@ def grpo_training(args: Namespace):
                     policy.save_pretrained(save_path)
                     tqdm.write(f"Saved checkpoint to {save_path}")
 
-            prompts:list[str] = samples["question"]
-            ground_truths:list[str] = samples["answer"]
+            prompts:list[str] = samples["prompt"]
+            ground_truths:list[str] = samples["response"]
             repeated_ground_truths = [gt for gt in ground_truths for _ in range(args.group_size)]
             ref_outputs = ref_model.generate(
                 prompts,
@@ -586,7 +586,7 @@ def main():
         "--train_batch_size", type=int, default=256, help="Batch size for training"
     )
     argparser.add_argument(
-        "--eval_batch_size", type=int, default=256, help="Batch size for evaluation"
+        "--eval_batch_size", type=int, default=512, help="Batch size for evaluation"
     )
     argparser.add_argument(
         "--epochs", type=int, default=10, help="Number of training epochs"
