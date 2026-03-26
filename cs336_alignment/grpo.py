@@ -322,7 +322,6 @@ def grpo_training(args: Namespace):
     assert args.train_batch_size % args.group_size == 0, (
     "train_batch_size must be divisible by group_size"
     )
-    n_prompts_per_rollout_batch = args.train_batch_size // args.group_size
     assert args.train_batch_size >= args.group_size, (
     "train_batch_size must be greater than or equal to group_size"
     )
@@ -392,6 +391,10 @@ def grpo_training(args: Namespace):
             train_dataset.iter(batch_size=micro_train_batch_size)
         ):
             step = i * train_step_per_epoch + j + 1
+
+            if (step-1) % args.ref_sync_steps == 0:
+                load_policy_into_vllm_instance(policy, ref_model)
+                clear_device_cache(garbage_collection=True)
 
             if (step-1) % args.eval_step == 0:
                 tqdm.write(f"Evaluating at step {step}...")
@@ -474,17 +477,12 @@ def grpo_training(args: Namespace):
             progress_bar.set_postfix({"loss": loss.item()})
             progress_bar.update(1)
             
-            counter += 1
             if step % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), max_norm=args.max_grad_norm
                 )
                 optimizer.step()
                 optimizer.zero_grad()
-
-            if step % args.ref_sync_steps == 0:
-                load_policy_into_vllm_instance(policy, ref_model)
-                clear_device_cache(garbage_collection=True)
 
             if step % args.metadata_wandb_log_step == 0:
                 clear_device_cache(garbage_collection=True)
@@ -593,6 +591,49 @@ def main():
         help="Number of microbatches to accumulate before each optimizer step",
     )
     argparser.add_argument(
+        "--group_size",
+        type=int,
+        default=8,
+        help="Number of responses per question (group) for reward normalization",
+    )
+    argparser.add_argument(
+        "--loss_type",
+        type=str,
+        default="grpo_clip",
+        choices=["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+        help="Type of policy gradient loss to use",
+    )
+    argparser.add_argument(
+        "--cliprange",
+        type=float,
+        default=0.2,
+        help="Clip parameter ε for GRPO-Clip loss (ignored for other loss types)",
+    )
+    argparser.add_argument(
+        "--sampling_temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for generation during training and evaluation",
+    )
+    argparser.add_argument(
+        "--sampling_max_tokens",
+        type=int,
+        default=1024,
+        help="Maximum number of tokens to generate during training and evaluation",
+    )
+    argparser.add_argument(
+        "--sampling_min_tokens",
+        type=int,
+        default=4,
+        help="Minimum number of tokens to generate during training and evaluation",
+    )
+    argparser.add_argument(
+        "--normalize_by_std",
+        action="store_true",
+        default=True,
+        help="Whether to normalize rewards by the per-group standard deviation (in addition to subtracting the mean)",
+    )
+    argparser.add_argument(
         "--metadata_wandb_log_step",
         type=int,
         default=10000,
@@ -609,6 +650,12 @@ def main():
         type=int,
         default=50000,
         help="Number of steps between logging generations",
+    )
+    argparser.add_argument(
+        "--ref_sync_steps",
+        type=int,
+        default=5000,
+        help="Number of steps between synchronizing the reference model with the policy",
     )
     argparser.add_argument(
         "--num_log",
