@@ -286,26 +286,29 @@ def prepare_inputs(outputs:list[RequestOutput], pad_token_id: int, device: torch
         "labels": input_ids[:, 1:].clone(),
     }
 
-def get_policy_log_probs(policy: PreTrainedModel, inputs: dict[str, torch.Tensor], micro_batch_size: int) -> torch.Tensor:
-    """Get per-token log probabilities from the policy for the given inputs."""
+def get_policy_log_probs_optimized_for_training(
+    policy: PreTrainedModel,
+    inputs: dict[str, torch.Tensor],
+    micro_batch_size: int
+) -> torch.Tensor:
+    """
+    Get per-token log probabilities from the policy for the given inputs,
+    optimized for a training loop.
+    """
     input_ids = inputs["input_ids"]
+    labels = inputs["labels"]
+    
     logits_list: list[torch.Tensor] = []
     for i in range(0, input_ids.size(0), micro_batch_size):
         model_output = policy(input_ids=input_ids[i:i+micro_batch_size])
         logits_list.append(model_output.logits)
+
     logits = torch.cat(logits_list, dim=0)
-    del logits_list
-    maxes, ids = logits.max(dim=-1, keepdim=True)
-    del ids
-    shift_logits = logits - maxes
-    del maxes
-    normalized_logits = shift_logits - torch.logsumexp(
-        shift_logits, dim=-1, keepdim=True
-    )
-    del shift_logits
-    index = inputs["labels"].unsqueeze(-1)
-    log_probs = normalized_logits.gather(dim=-1, 
-                                         index=index)
+
+    log_probs_full = F.log_softmax(logits, dim=-1)
+
+    log_probs = log_probs_full.gather(dim=-1, index=labels.unsqueeze(-1))
+
     return log_probs.squeeze(-1)
 
 def grpo_training(args: Namespace):
