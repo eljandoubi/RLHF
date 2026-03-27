@@ -4,7 +4,6 @@ from typing import Callable, Literal
 
 import torch
 from accelerate.utils.memory import clear_device_cache
-from multiprocess import cpu_count, get_context
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -16,7 +15,9 @@ from vllm import RequestOutput, SamplingParams
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.parallel_mapper import ParallelMapper
 from cs336_alignment.sft import (
+    core_log_gen,
     get_optimizer,
     init_vllm,
     load_policy_into_vllm_instance,
@@ -27,18 +28,9 @@ from cs336_alignment.summable_dict import SummableDict
 
 r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=False)
 
-def parallel_map(func, iterable1, iterable2, processes=None, chunksize=32):
-    processes = processes or cpu_count()
-    data = list(zip(iterable1, iterable2))
-
-    ctx = get_context("spawn")
-
-    with ctx.Pool(processes=processes) as pool:
-        return pool.starmap(func, data, chunksize)
-
 
 def compute_group_normalized_rewards(
-    reward_fnn: Callable[[str, str], dict[str, float]],
+    reward_fnn: ParallelMapper | Callable[[str, str], dict[str, float]],
     rollout_responses: list[str],
     repeated_ground_truths: list[str],
     group_size: int,
@@ -49,7 +41,7 @@ def compute_group_normalized_rewards(
     """
     Compute rewards for each group of rollout responses, normalized by the group size.
     Args:
-    reward_fn: Callable[[str, str], dict[str, float]] Scores the rollout responses against
+    reward_fn: ParallelMapper Scores the rollout responses against
     the ground truths, producing a dict with keys "reward", "format_reward", and
     "answer_reward".
     rollout_responses: list[str] Rollouts from the policy. The length of this list is
@@ -70,7 +62,9 @@ def compute_group_normalized_rewards(
     response.
     metadata your choice of other statistics to log (e.g. mean, std, max/min of rewards).
     """
-    outputs = parallel_map(reward_fnn, rollout_responses, repeated_ground_truths, processes=processes)
+    if not isinstance(reward_fnn, ParallelMapper):
+        reward_fnn = ParallelMapper(reward_fnn, processes)
+    outputs = reward_fnn.map(rollout_responses, repeated_ground_truths)
     raw_rewards = torch.tensor([output["reward"] for output in outputs])
     format_rewards = torch.tensor([output["format_reward"] for output in outputs])
     answer_rewards = torch.tensor([output["answer_reward"] for output in outputs])
@@ -294,11 +288,9 @@ def prepare_inputs(outputs:list[RequestOutput], pad_token_id: int, device: torch
 def get_policy_log_probs(policy: PreTrainedModel, inputs: dict[str, torch.Tensor], micro_batch_size: int) -> torch.Tensor:
     """Get per-token log probabilities from the policy for the given inputs."""
     input_ids = inputs["input_ids"]
-    response_mask = inputs["response_mask"]
     logits_list: list[torch.Tensor] = []
     for i in range(0, input_ids.size(0), micro_batch_size):
-        model_output = policy(input_ids=input_ids[i:i+micro_batch_size],
-                            attention_mask=response_mask[i:i+micro_batch_size])
+        model_output = policy(input_ids=input_ids[i:i+micro_batch_size])
         logits_list.append(model_output.logits)
     logits = torch.cat(logits_list, dim=0)
     del logits_list
@@ -392,6 +384,11 @@ def grpo_training(args: Namespace):
     progress_bar = tqdm(total=total_steps, desc="GRPO Training")
     mean_metadata = SummableDict()
     counter = 0
+    parallel_reward_fn = ParallelMapper(r1_zero_reward_fn, processes=args.num_proc)
+    eval_log_core = ParallelMapper(partial(core_log_gen,return_objects="only_sum"),
+                                   processes=args.num_proc)
+    parallel_log_core = ParallelMapper(partial(core_log_gen,return_objects="both"),
+                                   processes=args.num_proc)
     for i in range(args.epochs):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=micro_train_batch_size)
@@ -412,9 +409,9 @@ def grpo_training(args: Namespace):
                             model=ref_model,
                             prompts=eval_samples["prompt"],
                             ground_truths=eval_samples["response"],
-                            reward_fn=r1_zero_reward_fn,
+                            parallel_core=eval_log_core,
                             sampling_params=eval_sampling_params,
-                            return_obejcts="only_sum",
+                            return_objects="only_sum",
                         )["only_sum"]
 
                 num_samples = avg_scores.pop("num_samples", 1)
@@ -438,7 +435,7 @@ def grpo_training(args: Namespace):
             )
             rollout_responses = [out.text for ref_gen in ref_outputs for out in ref_gen.outputs]
             advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
-                reward_fnn=r1_zero_reward_fn,
+                reward_fnn=parallel_reward_fn,
                 rollout_responses=rollout_responses,
                 repeated_ground_truths=repeated_ground_truths,
                 group_size=args.group_size,
@@ -507,7 +504,7 @@ def grpo_training(args: Namespace):
                     model=ref_model,
                     prompts=samples["prompt"],
                     ground_truths=samples["response"],
-                    reward_fn=r1_zero_reward_fn,
+                    parallel_core=parallel_log_core,
                     sampling_params=eval_sampling_params,
                     num_log=args.num_log,
                 )
@@ -640,6 +637,10 @@ def main():
         default=True,
         help="Whether to normalize rewards by the per-group standard deviation (in addition to subtracting the mean)",
     )
+    argparser.add_argument("--early_stopping", action="store_true", default=True)
+    argparser.add_argument("--early_stopping_metric", type=str, default="reward")
+    argparser.add_argument("--early_stopping_patience", type=int, default=5)
+    argparser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
     argparser.add_argument(
         "--advantage_eps",
         type=float,
@@ -717,7 +718,7 @@ def main():
     )
     args = argparser.parse_args()
     wandb.login()
-    wandb.init(project="cs336_sft", config=vars(args))
+    wandb.init(project="cs336_grpo", config=vars(args))
     grpo_training(args)
 
 

@@ -15,11 +15,12 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
 )
-from vllm import LLM, SamplingParams
+from vllm import LLM, RequestOutput, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.parallel_mapper import ParallelMapper
 from cs336_alignment.summable_dict import SummableDict, dict_mean
 from cs336_alignment.utils import format_sample
 
@@ -200,16 +201,46 @@ def sft_microbatch_train_step(
         }
     return loss, metadata
 
+def core_log_gen(response:RequestOutput, ground_truth:str, prompt:str|None=None,
+                 reward_fn: Callable[[str, str], dict[str, float]]=r1_zero_reward_fn,
+                 return_objects: Literal["samples", "stats", "both","only_sum"] = "both"):
+    
+    response_text = response.outputs[0].text
+
+    reward_dict = reward_fn(response_text, ground_truth)
+
+    response_len = len(response.outputs[0].token_ids)
+
+    logprobs = response.outputs[0].logprobs
+    if logprobs is not None:
+        smp_ent = -sum(lp.logprob for dt in logprobs for lp in dt.values())
+    else:
+        smp_ent = 0.0
+
+    sample =             {
+
+            "reward": reward_dict.get("reward", 0.0),
+            "format_reward": reward_dict.get("format_reward", 0.0),
+            "answer_reward": reward_dict.get("answer_reward", 0.0),
+            "sample_entropy": smp_ent,
+            "response_len": response_len,
+        }
+    
+    if return_objects in ["samples", "both"]:
+        sample["prompt"] = prompt
+        sample["response"] = response_text
+        sample["ground_truth"] = ground_truth
+
+    return sample
 
 def log_generations(
     model: LLM,
     prompts: list[str],
     ground_truths: list[str],
-    reward_fn: Callable[[str, str], dict[str, float]],
-    *,
+    parallel_core: ParallelMapper,
     sampling_params: SamplingParams,
     num_log: int | None = None,
-    return_obejcts: Literal["samples", "stats", "both","only_sum"] = "both",
+    return_objects: Literal["samples", "stats", "both","only_sum"] = "both",
 ) -> dict[str, Any]:
     """
     Generate responses for a few prompts and log:
@@ -231,47 +262,17 @@ def log_generations(
 
     # generate responses with vLLM
     responses = model.generate(prompts, sampling_params, use_tqdm=False)
-
-    samples: list[dict[str, Any]] = []
-    
-    for i, response in enumerate(responses):
-        prompt = prompts[i]
-        gt = ground_truths[i]
-        response_text = response.outputs[0].text
-
-        reward_dict = reward_fn(response_text, gt)
-
-        response_len = len(response.outputs[0].token_ids)
-
-        logprobs = response.outputs[0].logprobs
-        if logprobs is not None:
-            smp_ent = -sum(lp.logprob for dt in logprobs for lp in dt.values())
-        else:
-            smp_ent = 0.0
-
-        sample =             {
-
-                "reward": reward_dict.get("reward", 0.0),
-                "format_reward": reward_dict.get("format_reward", 0.0),
-                "answer_reward": reward_dict.get("answer_reward", 0.0),
-                "sample_entropy": smp_ent,
-                "response_len": response_len,
-            }
+    if return_objects in ["samples", "both"]:
+        samples = parallel_core.map(responses, ground_truths, prompts)
+        if return_objects == "both":
+            return {"samples": samples, "stats": dict_mean(samples)}
         
-        if return_obejcts in ["samples", "both"]:
-            sample["prompt"] = prompt
-            sample["response"] = response_text
-            sample["ground_truth"] = gt
-
-        samples.append(sample)
-
-    if return_obejcts == "both":
-        return {"samples": samples, "stats": dict_mean(samples)}
-    if return_obejcts == "samples":
         return {"samples": samples}
-    if return_obejcts == "stats":
-        return {"stats": dict_mean(samples)}
-    if return_obejcts == "only_sum":
+    else:
+        samples = parallel_core.map(responses, ground_truths)
+        if return_objects == "stats":
+            return {"stats": dict_mean(samples)}
+
         return {"only_sum": dict_mean(samples, only_sum=True)}
 
 
@@ -413,6 +414,10 @@ def sft_training(args: Namespace):
     progress_bar = tqdm(total=total_steps, desc="SFT Training")
     mean_metadata = SummableDict()
     counter = 0
+    eval_log_core = ParallelMapper(partial(core_log_gen,return_objects="only_sum"),
+                                   processes=args.num_proc)
+    parallel_log_core = ParallelMapper(partial(core_log_gen,return_objects="both"),
+                                   processes=args.num_proc)
     for i in range(args.epochs):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=args.train_batch_size)
@@ -429,9 +434,9 @@ def sft_training(args: Namespace):
                             model=ref_model,
                             prompts=eval_samples["prompt"],
                             ground_truths=eval_samples["response"],
-                            reward_fn=r1_zero_reward_fn,
+                            parallel_core=eval_log_core,
                             sampling_params=sampling_params,
-                            return_obejcts="only_sum",
+                            return_objects="only_sum",
                         )["only_sum"]
 
                 num_samples = avg_scores.pop("num_samples", 1)
@@ -490,7 +495,7 @@ def sft_training(args: Namespace):
                     model=ref_model,
                     prompts=samples["prompt"],
                     ground_truths=samples["response"],
-                    reward_fn=r1_zero_reward_fn,
+                    parallel_core=parallel_log_core,
                     sampling_params=sampling_params,
                     num_log=args.num_log,
                 )
@@ -550,7 +555,7 @@ def main():
     argparser.add_argument(
         "--vllm_device",
         type=str,
-        default="cuda:1",
+        default="cuda:0",
         help="Device for the vLLM reference model (e.g. 'cuda:1')",
     )
     argparser.add_argument(
@@ -569,7 +574,7 @@ def main():
         "--train_batch_size", type=int, default=2, help="Batch size for training"
     )
     argparser.add_argument(
-        "--eval_batch_size", type=int, default=256, help="Batch size for evaluation"
+        "--eval_batch_size", type=int, default=2, help="Batch size for evaluation"
     )
     argparser.add_argument(
         "--epochs", type=int, default=10, help="Number of training epochs"
