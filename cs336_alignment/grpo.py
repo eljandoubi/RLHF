@@ -3,6 +3,7 @@ from functools import partial
 from typing import Callable, Literal
 
 import torch
+from torch.nn import functional as F
 from accelerate.utils.memory import clear_device_cache
 from tqdm import tqdm
 from transformers import (
