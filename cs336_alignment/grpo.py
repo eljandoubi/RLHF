@@ -15,6 +15,7 @@ from vllm import RequestOutput, SamplingParams
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.early_stopping import EarlyStopping
 from cs336_alignment.parallel_mapper import ParallelMapper
 from cs336_alignment.sft import (
     core_log_gen,
@@ -389,6 +390,17 @@ def grpo_training(args: Namespace):
                                    processes=args.num_proc)
     parallel_log_core = ParallelMapper(partial(core_log_gen,return_objects="both"),
                                    processes=args.num_proc)
+    
+
+    early_stopper = EarlyStopping(
+        metric_name=args.early_stopping_metric,
+        patience=args.early_stopping_patience,
+        min_delta=args.early_stopping_min_delta,
+        mode="max",
+        min_steps=10,  # optional warmup
+        smoothing_window=3,  # helps with RL noise
+        output_dir=args.output_dir,
+    )
     for i in range(args.epochs):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=micro_train_batch_size)
@@ -424,6 +436,27 @@ def grpo_training(args: Namespace):
                     save_path = f"{args.output_dir}/checkpoint-{step}"
                     policy.save_pretrained(save_path)
                     tqdm.write(f"Saved checkpoint to {save_path}")
+                
+                stop, es_info = early_stopper.update(avg_scores, model=policy)
+
+                tqdm.write(
+                    f"[EarlyStopping] metric={es_info['smoothed_metric']:.4f}, "
+                    f"best={es_info['best_metric']:.4f}, "
+                    f"patience={es_info['patience_counter']}/{args.early_stopping_patience}"
+                )
+
+                wandb.log(
+                    {
+                        "early_stopping/metric": es_info["smoothed_metric"],
+                        "early_stopping/best": es_info["best_metric"],
+                        "early_stopping/patience": es_info["patience_counter"],
+                    },
+                    step=step,
+                )
+
+                if stop:
+                    tqdm.write("Early stopping triggered.")
+                    return
 
             prompts:list[str] = samples["prompt"]
             ground_truths:list[str] = samples["response"]
@@ -639,7 +672,7 @@ def main():
     )
     argparser.add_argument("--early_stopping", action="store_true", default=True)
     argparser.add_argument("--early_stopping_metric", type=str, default="reward")
-    argparser.add_argument("--early_stopping_patience", type=int, default=5)
+    argparser.add_argument("--early_stopping_patience", type=int, default=3)
     argparser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
     argparser.add_argument(
         "--advantage_eps",
