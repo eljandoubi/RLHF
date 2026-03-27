@@ -641,6 +641,12 @@ def main():
         help="Whether to normalize rewards by the per-group standard deviation (in addition to subtracting the mean)",
     )
     argparser.add_argument(
+        "--advantage_eps",
+        type=float,
+        default=1e-6,
+        help="Small constant to avoid division by zero in normalization."
+    )
+    argparser.add_argument(
         "--metadata_wandb_log_step",
         type=int,
         default=10000,
@@ -649,7 +655,7 @@ def main():
     argparser.add_argument(
         "--eval_step",
         type=int,
-        default=200000,
+        default=100000,
         help="Number of steps between evaluations",
     )
     argparser.add_argument(
@@ -694,7 +700,7 @@ def main():
     argparser.add_argument(
         "--test_size",
         type=float,
-        default=0.2,
+        default=0.1,
         help="Test size for train/test split if the dataset does not have a predefined test split",
     )
     argparser.add_argument(
