@@ -286,7 +286,7 @@ def prepare_inputs(outputs:list[RequestOutput], pad_token_id: int, device: torch
         "labels": input_ids[:, 1:].clone(),
     }
 
-def get_policy_log_probs_optimized_for_training(
+def get_policy_log_probs(
     policy: PreTrainedModel,
     inputs: dict[str, torch.Tensor],
     micro_batch_size: int
