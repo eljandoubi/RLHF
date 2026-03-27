@@ -269,7 +269,7 @@ def get_rollout_logprobs(outputs:list[RequestOutput]) -> torch.Tensor:
 def prepare_inputs(outputs:list[RequestOutput], pad_token_id: int, device: torch.device) -> dict[str, torch.Tensor]:
 
     input_ids = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(ref_gen.prompt_token_ids + out.token_ids) 
+            [torch.tensor(ref_gen.prompt_token_ids + list(out.token_ids)) 
              for ref_gen in outputs for out in ref_gen.outputs], 
             batch_first=True, padding_value=pad_token_id
         ).long().to(device)
@@ -407,11 +407,11 @@ def grpo_training(args: Namespace):
         ):
             step = i * train_step_per_epoch + j + 1
 
-            if (step-1) % args.ref_sync_steps == 0:
+            if step % args.ref_sync_steps == 0:
                 load_policy_into_vllm_instance(policy, ref_model)
                 clear_device_cache(garbage_collection=True)
 
-            if (step-1) % args.eval_step == 0:
+            if step % args.eval_step == 0:
                 tqdm.write(f"Evaluating at step {step}...")
                 clear_device_cache(garbage_collection=True)
                 avg_scores =  SummableDict()
@@ -432,10 +432,10 @@ def grpo_training(args: Namespace):
                 for metric, score in avg_scores.items():
                     tqdm.write(f"  {metric}: {score:.4f}")
                 wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
-                if step>1:
-                    save_path = f"{args.output_dir}/checkpoint-{step}"
-                    policy.save_pretrained(save_path)
-                    tqdm.write(f"Saved checkpoint to {save_path}")
+                
+                save_path = f"{args.output_dir}/checkpoint-{step}"
+                policy.save_pretrained(save_path)
+                tqdm.write(f"Saved checkpoint to {save_path}")
                 
                 stop, es_info = early_stopper.update(avg_scores, model=policy)
 
