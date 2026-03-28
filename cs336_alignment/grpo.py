@@ -255,7 +255,7 @@ def grpo_microbatch_train_step(
     return loss.detach(), metadata
 
 def get_rollout_logprobs(outputs:list[RequestOutput]) -> torch.Tensor:
-    rollout_logprobs = [  ([0.0 for _ in ref_gen.prompt_token_ids]
+    rollout_logprobs = [  ([0.0 for _ in ref_gen.prompt_token_ids[1:]]
                            +[next(iter(pb.values())).logprob 
                                     for pb in out.logprobs])
                          for ref_gen in outputs 
