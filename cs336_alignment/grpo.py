@@ -3,8 +3,8 @@ from functools import partial
 from typing import Callable, Literal
 
 import torch
-from torch.nn import functional as F
 from accelerate.utils.memory import clear_device_cache
+from torch.nn import functional as F
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -255,7 +255,7 @@ def grpo_microbatch_train_step(
     return loss.detach(), metadata
 
 def get_rollout_logprobs(outputs:list[RequestOutput]) -> torch.Tensor:
-    rollout_logprobs = [  ([0.0 for _ in ref_gen.prompt_token_ids[1:]]
+    rollout_logprobs = [  ([0.0] *(len(ref_gen.prompt_token_ids)-1)
                            +[next(iter(pb.values())).logprob 
                                     for pb in out.logprobs])
                          for ref_gen in outputs 
@@ -267,52 +267,48 @@ def get_rollout_logprobs(outputs:list[RequestOutput]) -> torch.Tensor:
         )
     return old_logprobs
 
-def prepare_inputs(outputs:list[RequestOutput], pad_token_id: int, device: torch.device) -> dict[str, torch.Tensor]:
+def prepare_mask(outputs:list[RequestOutput], device: torch.device) -> torch.Tensor:
 
-    input_ids = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(ref_gen.prompt_token_ids + list(out.token_ids)) 
-             for ref_gen in outputs for out in ref_gen.outputs], 
-            batch_first=True, padding_value=pad_token_id
-        ).long().to(device)
-    
-    response_mask = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor([0]*len(ref_gen.prompt_token_ids) + [1]*len(out.token_ids)) 
+    return torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor([0]*(len(ref_gen.prompt_token_ids)-1) + [1]*len(out.token_ids)) 
              for ref_gen in outputs for out in ref_gen.outputs],
             batch_first=True, padding_value=0
-        ).long().to(device)
+        ).to(device=device,dtype=torch.bool)
     
-    return {
-        "input_ids": input_ids[:,:-1],
-        "response_mask": response_mask[:, 1:],
-        "labels": input_ids[:, 1:].clone(),
-    }
+
 
 def get_policy_log_probs(
     policy: PreTrainedModel,
-    inputs: dict[str, torch.Tensor],
+    outputs:list[RequestOutput],
+    pad_token_id: int,
     micro_batch_size: int
 ) -> torch.Tensor:
     """
     Get per-token log probabilities from the policy for the given inputs,
     optimized for a training loop.
     """
-    input_ids = inputs["input_ids"]
-    labels = inputs["labels"]
-    
+
     log_probs_list = []
-    for i in range(0, input_ids.size(0), micro_batch_size):
+    for i in range(0, len(outputs), micro_batch_size):
         # Get logits for the micro-batch
-        model_output = policy(input_ids=input_ids[i:i+micro_batch_size])
+        seq_ids = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(ref_gen.prompt_token_ids + list(out.token_ids)) 
+             for ref_gen in outputs[i:i+micro_batch_size]
+             for out in ref_gen.outputs], 
+            batch_first=True, padding_value=pad_token_id
+        ).to(device=policy.device,dtype=torch.long)
+
+        model_output = policy(input_ids=seq_ids[:,:-1])
         logits_chunk = model_output.logits
     
         # --- Perform expensive operations on the small chunk ---
         log_probs_full_chunk = F.log_softmax(logits_chunk, dim=-1)
         
         # Get labels for the current chunk
-        labels_chunk = labels[i:i+micro_batch_size]
+        labels_chunk = seq_ids[:, 1:].unsqueeze(-1)
         
         # Gather the log probs for the actual tokens
-        log_probs_chunk = log_probs_full_chunk.gather(dim=-1, index=labels_chunk.unsqueeze(-1))
+        log_probs_chunk = log_probs_full_chunk.gather(dim=-1, index=labels_chunk)
         
         log_probs_list.append(log_probs_chunk.squeeze(-1))
     
@@ -503,16 +499,15 @@ def grpo_training(args: Namespace):
             else:
                 cliprange = None
                 old_log_probs = None
-
-            inputs = prepare_inputs(ref_outputs, tokenizer.pad_token_id,
-                                    args.policy_device)
-            
-            policy_log_probs = get_policy_log_probs(policy, inputs,
+       
+            policy_log_probs = get_policy_log_probs(policy, 
+                                                    ref_outputs,
+                                                    tokenizer.pad_token_id,
                                                     micro_train_batch_size)
 
             loss, metadata = grpo_microbatch_train_step(
                 policy_log_probs=policy_log_probs,
-                response_mask=inputs["response_mask"],
+                response_mask=prepare_mask(ref_outputs,args.policy_device),
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 loss_type=args.loss_type,
                 raw_rewards=raw_rewards,
