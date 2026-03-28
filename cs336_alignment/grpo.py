@@ -132,6 +132,9 @@ def compute_grpo_clip_loss(
     token was clipped or not, i.e., whether the clipped policy gradient loss on the RHS of
     the min was lower than the LHS.
     """
+    if advantages.ndim==1:
+        advantages = advantages.view(-1,1)
+
     ratio = torch.exp(policy_log_probs - old_log_probs)
     clipped_ratio = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
     loss1 = advantages * ratio
