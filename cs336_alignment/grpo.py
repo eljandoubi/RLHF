@@ -299,18 +299,26 @@ def get_policy_log_probs(
     input_ids = inputs["input_ids"]
     labels = inputs["labels"]
     
-    logits_list: list[torch.Tensor] = []
+    log_probs_list = []
     for i in range(0, input_ids.size(0), micro_batch_size):
+        # Get logits for the micro-batch
         model_output = policy(input_ids=input_ids[i:i+micro_batch_size])
-        logits_list.append(model_output.logits)
-
-    logits = torch.cat(logits_list, dim=0)
-
-    log_probs_full = F.log_softmax(logits, dim=-1)
-
-    log_probs = log_probs_full.gather(dim=-1, index=labels.unsqueeze(-1))
-
-    return log_probs.squeeze(-1)
+        logits_chunk = model_output.logits
+    
+        # --- Perform expensive operations on the small chunk ---
+        log_probs_full_chunk = F.log_softmax(logits_chunk, dim=-1)
+        
+        # Get labels for the current chunk
+        labels_chunk = labels[i:i+micro_batch_size]
+        
+        # Gather the log probs for the actual tokens
+        log_probs_chunk = log_probs_full_chunk.gather(dim=-1, index=labels_chunk.unsqueeze(-1))
+        
+        log_probs_list.append(log_probs_chunk.squeeze(-1))
+    
+    # Concatenate the final, small tensors
+    all_log_probs = torch.cat(log_probs_list, dim=0)
+    return all_log_probs
 
 def grpo_training(args: Namespace):
     """
