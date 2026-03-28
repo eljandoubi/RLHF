@@ -290,30 +290,30 @@ def get_policy_log_probs(
     Get per-token log probabilities from the policy for the given inputs,
     optimized for a training loop.
     """
-
-    log_probs_list = []
-    for i in range(0, len(outputs), micro_batch_size):
-        # Get logits for the micro-batch
-        seq_ids = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(ref_gen.prompt_token_ids + list(out.token_ids)) 
-             for ref_gen in outputs[i:i+micro_batch_size]
+    seq_ids = torch.nn.utils.rnn.pad_sequence(
+            [torch.as_tensor(ref_gen.prompt_token_ids + list(out.token_ids),
+                             dtype=torch.long)
+             for ref_gen in outputs
              for out in ref_gen.outputs], 
             batch_first=True, padding_value=pad_token_id
-        ).to(device=policy.device,dtype=torch.long)
-
-        model_output = policy(input_ids=seq_ids[:,:-1])
-        logits_chunk = model_output.logits
+        ).long().to(policy.device)
     
-        # --- Perform expensive operations on the small chunk ---
-        log_probs_full_chunk = F.log_softmax(logits_chunk, dim=-1)
+    log_probs_list = []
+    for i in range(0, seq_ids.size(0), micro_batch_size):
+        chunk = seq_ids[i:i+micro_batch_size]
+        input_chunk = chunk[:, :-1]
+        labels_chunk = chunk[:, 1:]
+
+        logits_chunk: torch.Tensor = policy(input_ids=input_chunk).logits
         
-        # Get labels for the current chunk
-        labels_chunk = seq_ids[:, 1:].unsqueeze(-1)
+        log_probs_chunk = -F.cross_entropy(
+            logits_chunk.reshape(-1, logits_chunk.size(-1)),
+            labels_chunk.reshape(-1),
+            reduction='none',
+            ignore_index=pad_token_id
+        ).reshape(labels_chunk.shape)
         
-        # Gather the log probs for the actual tokens
-        log_probs_chunk = log_probs_full_chunk.gather(dim=-1, index=labels_chunk)
-        
-        log_probs_list.append(log_probs_chunk.squeeze(-1))
+        log_probs_list.append(log_probs_chunk)
     
     # Concatenate the final, small tensors
     all_log_probs = torch.cat(log_probs_list, dim=0)
