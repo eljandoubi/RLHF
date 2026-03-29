@@ -141,7 +141,7 @@ def compute_grpo_clip_loss(
     loss2 = advantages * clipped_ratio
     loss = -torch.minimum(loss1, loss2)
     with torch.inference_mode():
-        metadata = {"clipped": (loss1.detach() >= loss2.detach()).float().mean()}
+        metadata = {"clipped": (loss1.detach() >= loss2.detach()).float().mean().item()}
     return loss, metadata
 
 def compute_policy_gradient_loss(
