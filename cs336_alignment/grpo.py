@@ -1,9 +1,10 @@
 from argparse import ArgumentParser, Namespace
 from functools import partial
 from typing import Callable, Literal
-
+from contextlib import nullcontext
 import torch
 from accelerate.utils.memory import clear_device_cache
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
 from tqdm import tqdm
 from transformers import (
@@ -224,6 +225,7 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    scaler: GradScaler | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Execute a forward-and-backward pass on a microbatch.
@@ -245,16 +247,21 @@ def grpo_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
         might want to log.
     """
-    loss, metadata = compute_policy_gradient_loss(
-        policy_log_probs=policy_log_probs,
-        loss_type=loss_type,
-        raw_rewards=raw_rewards,
-        advantages=advantages,
-        old_log_probs=old_log_probs,
-        cliprange=cliprange,
-    )
-    loss = masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
-    loss.backward()
+    context_manager = nullcontext() if scaler is None else  autocast(dtype=torch.bfloat16)
+    with context_manager:
+        loss, metadata = compute_policy_gradient_loss(
+            policy_log_probs=policy_log_probs,
+            loss_type=loss_type,
+            raw_rewards=raw_rewards,
+            advantages=advantages,
+            old_log_probs=old_log_probs,
+            cliprange=cliprange,
+        )
+        loss = masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
+    if scaler is None:
+        loss.backward()
+    else:
+        scaler.scale(loss).backward()
     return loss.detach(), metadata
 
 def get_rollout_logprobs(outputs:list[RequestOutput]) -> torch.Tensor:
@@ -343,6 +350,7 @@ def grpo_training(args: Namespace):
         attn_implementation="flash_attention_2",
     ).to(args.policy_device)
     optimizer_cls = get_optimizer(args.optimizer)
+    scaler = GradScaler()
     optimizer: torch.optim.Optimizer = optimizer_cls(
         policy.parameters(), lr=args.learning_rate,
         weight_decay=0.0,
@@ -525,10 +533,15 @@ def grpo_training(args: Namespace):
             progress_bar.update(1)
             
             if step % args.gradient_accumulation_steps == 0:
+                # Unscale gradients before clipping
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), max_norm=args.max_grad_norm
-                )
-                optimizer.step()
+                  )
+                # Optimizer step
+                scaler.step(optimizer)
+                # Update the scaler for the next iteration
+                scaler.update()
                 optimizer.zero_grad()
 
             if step % args.metadata_wandb_log_step == 0:
