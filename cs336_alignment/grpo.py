@@ -1,10 +1,11 @@
 from argparse import ArgumentParser, Namespace
+from contextlib import nullcontext
 from functools import partial
 from typing import Callable, Literal
-from contextlib import nullcontext
+
 import torch
 from accelerate.utils.memory import clear_device_cache
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from tqdm import tqdm
 from transformers import (
@@ -349,8 +350,13 @@ def grpo_training(args: Namespace):
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     ).to(args.policy_device)
+    if args.enable_gradient_checkpointing:
+        policy.gradient_checkpointing_enable()
+    else:
+        policy.gradient_checkpointing_disable()
+    
     optimizer_cls = get_optimizer(args.optimizer)
-    scaler = GradScaler()
+    scaler = GradScaler() if args.use_scaler else None
     optimizer: torch.optim.Optimizer = optimizer_cls(
         policy.parameters(), lr=args.learning_rate,
         weight_decay=0.0,
@@ -533,15 +539,14 @@ def grpo_training(args: Namespace):
             progress_bar.update(1)
             
             if step % args.gradient_accumulation_steps == 0:
-                # Unscale gradients before clipping
-                scaler.unscale_(optimizer)
+                if args.use_scaler:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), max_norm=args.max_grad_norm
                   )
-                # Optimizer step
                 scaler.step(optimizer)
-                # Update the scaler for the next iteration
-                scaler.update()
+                if args.use_scaler:
+                    scaler.update()
                 optimizer.zero_grad()
 
             if step % args.metadata_wandb_log_step == 0:
@@ -693,6 +698,8 @@ def main():
         default=True,
         help="Whether to normalize rewards by the per-group standard deviation (in addition to subtracting the mean)",
     )
+    argparser.add_argument("--use_scaler",action="store_true",default=True)
+    argparser.add_argument("--enable_gradient_checkpointing",action="store_true",default=True)
     argparser.add_argument("--early_stopping", action="store_true", default=True)
     argparser.add_argument("--early_stopping_metric", type=str, default="reward")
     argparser.add_argument("--early_stopping_patience", type=int, default=3)
