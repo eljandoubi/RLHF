@@ -539,29 +539,28 @@ def grpo_training(args: Namespace):
             progress_bar.update(1)
             
             if step % args.gradient_accumulation_steps == 0:
-            # First, handle gradient clipping and the optimizer step
-            if args.use_scaler:
-                # Unscale gradients before clipping
-                scaler.unscale_(optimizer)
-                
-                torch.nn.utils.clip_grad_norm_(
-                    policy.parameters(), max_norm=args.max_grad_norm
-                )
-                
-                # scaler.step() performs the optimizer step
-                scaler.step(optimizer)
-                
-                # Update the scale for the next iteration
-                scaler.update()
-            else:
-                # Standard gradient clipping and optimizer step without a scaler
-                torch.nn.utils.clip_grad_norm_(
-                    policy.parameters(), max_norm=args.max_grad_norm
-                )
-                optimizer.step()
-        
-            # Reset gradients for the next accumulation cycle
-            optimizer.zero_grad()
+                if args.use_scaler:
+                    # Unscale gradients before clipping
+                    scaler.unscale_(optimizer)
+                    
+                    torch.nn.utils.clip_grad_norm_(
+                        policy.parameters(), max_norm=args.max_grad_norm
+                    )
+                    
+                    # scaler.step() performs the optimizer step
+                    scaler.step(optimizer)
+                    
+                    # Update the scale for the next iteration
+                    scaler.update()
+                else:
+                    # Standard gradient clipping and optimizer step without a scaler
+                    torch.nn.utils.clip_grad_norm_(
+                        policy.parameters(), max_norm=args.max_grad_norm
+                    )
+                    optimizer.step()
+            
+                # Reset gradients for the next accumulation cycle
+                optimizer.zero_grad()
 
             if step % args.metadata_wandb_log_step == 0:
                 clear_device_cache(garbage_collection=True)
