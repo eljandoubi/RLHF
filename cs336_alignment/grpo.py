@@ -711,7 +711,7 @@ def main():
         default=True,
         help="Whether to normalize rewards by the per-group standard deviation (in addition to subtracting the mean)",
     )
-    argparser.add_argument("--use_scaler",action="store_true",default=True)
+    argparser.add_argument("--use_scaler",action="store_true")
     argparser.add_argument("--enable_gradient_checkpointing",action="store_true",default=True)
     argparser.add_argument("--early_stopping", action="store_true", default=True)
     argparser.add_argument("--early_stopping_metric", type=str, default="reward")
