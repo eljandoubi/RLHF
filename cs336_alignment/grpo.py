@@ -408,7 +408,7 @@ def generate_and_compute_rewards(
         group_size=args.group_size,
         advantage_eps=args.advantage_eps,
         normalize_by_std=args.normalize_by_std,
-        processes=min(rollout_responses, args.num_proc),
+        processes=min(len(rollout_responses), args.num_proc),
     )
 
     # Return all the data the main training step will need
