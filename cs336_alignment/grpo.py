@@ -5,6 +5,7 @@ from typing import Callable, Literal
 
 import torch
 from accelerate.utils.memory import clear_device_cache
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -292,7 +293,8 @@ def get_policy_log_probs(
     policy: PreTrainedModel,
     outputs:list[RequestOutput],
     pad_token_id: int,
-    micro_batch_size: int
+    micro_batch_size: int | None = None,
+    use_liger: bool = False,
 ) -> torch.Tensor:
     """
     Get per-token log probabilities from the policy for the given inputs,
@@ -305,14 +307,25 @@ def get_policy_log_probs(
              for out in ref_gen.outputs], 
             batch_first=True, padding_value=pad_token_id
         ).long().to(policy.device)
-    
+    attention_mask = (seq_ids != pad_token_id).long()
+    if use_liger:
+        p_outputs = policy(input_ids=seq_ids[:,:-1],
+                attention_mask=attention_mask[:,:-1],
+                labels=seq_ids[:,1:],
+                skip_logits=True,
+                reduction='none')
+        return p_outputs.loss.reshape(len(outputs),-1)
+
     log_probs_list = []
     for i in range(0, seq_ids.size(0), micro_batch_size):
         chunk = seq_ids[i:i+micro_batch_size]
         input_chunk = chunk[:, :-1]
+        mask_chunk = attention_mask[i:i+micro_batch_size, :-1]
         labels_chunk = chunk[:, 1:]
 
-        logits_chunk: torch.Tensor = policy(input_ids=input_chunk).logits
+
+        logits_chunk: torch.Tensor = policy(input_ids=input_chunk,
+                                            attention_mask=mask_chunk).logits
         
         log_probs_chunk = -F.cross_entropy(
             logits_chunk.reshape(-1, logits_chunk.size(-1)),
@@ -344,8 +357,11 @@ def grpo_training(args: Namespace):
     assert args.train_batch_size >= args.group_size, (
     "train_batch_size must be greater than or equal to group_size"
     )
-
-    policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+    if args.use_liger:
+        CausalLM = AutoLigerKernelForCausalLM
+    else:
+        CausalLM = AutoModelForCausalLM
+    policy: PreTrainedModel = CausalLM.from_pretrained(
         args.policy_model_id,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
@@ -520,7 +536,8 @@ def grpo_training(args: Namespace):
             policy_log_probs = get_policy_log_probs(policy, 
                                                     ref_outputs,
                                                     tokenizer.pad_token_id,
-                                                    micro_train_batch_size)
+                                                    micro_train_batch_size,
+                                                    args.use_liger)
 
             loss, metadata = grpo_microbatch_train_step(
                 policy_log_probs=policy_log_probs,
@@ -711,8 +728,9 @@ def main():
         default=True,
         help="Whether to normalize rewards by the per-group standard deviation (in addition to subtracting the mean)",
     )
-    argparser.add_argument("--use_scaler",action="store_true")
-    argparser.add_argument("--enable_gradient_checkpointing",action="store_true",default=True)
+    argparser.add_argument("--use_scaler", action="store_true")
+    argparser.add_argument("--use_liger", action="store_true", default=True)
+    argparser.add_argument("--enable_gradient_checkpointing", action="store_true")
     argparser.add_argument("--early_stopping", action="store_true", default=True)
     argparser.add_argument("--early_stopping_metric", type=str, default="reward")
     argparser.add_argument("--early_stopping_patience", type=int, default=3)

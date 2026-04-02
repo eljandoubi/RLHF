@@ -158,6 +158,7 @@ dependencies = [
     { name = "dataset" },
     { name = "flash-attn" },
     { name = "jupyter" },
+    { name = "liger-kernel" },
     { name = "math-verify", extra = ["antlr4-13-2"] },
     { name = "multiprocess" },
     { name = "notebook" },
@@ -180,6 +181,7 @@ requires-dist = [
     { name = "dataset", specifier = ">=1.6.2" },
     { name = "flash-attn", specifier = "==2.7.4.post1" },
     { name = "jupyter", specifier = ">=1.1.1" },
+    { name = "liger-kernel", git = "https://github.com/eljandoubi/Liger-Kernel?rev=reduction" },
     { name = "math-verify", extras = ["antlr4-13-2"], specifier = ">=0.7.0" },
     { name = "multiprocess", specifier = ">=0.70.19" },
     { name = "notebook", specifier = ">=7.4.2" },
@@ -1692,6 +1694,15 @@ wheels = [
 [package.optional-dependencies]
 antlr4-13-2 = [
     { name = "antlr4-python3-runtime" },
+]
+
+[[package]]
+name = "liger-kernel"
+version = "0.7.0"
+source = { git = "https://github.com/eljandoubi/Liger-Kernel?rev=reduction#5fbde7703b6ce79163fd7af570fd32611d4a5d78" }
+dependencies = [
+    { name = "torch" },
+    { name = "triton" },
 ]
 
 [[package]]
@@ -3738,7 +3749,7 @@ name = "triton"
 version = "3.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "filelock", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "filelock" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/86/17/d9a5cf4fcf46291856d1e90762e36cbabd2a56c7265da0d1d9508c8e3943/triton-3.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:0f34f6e7885d1bf0eaaf7ba875a5f0ce6f3c13ba98f9503651c1e6dc6757ed5c", size = 209506424, upload-time = "2024-10-14T16:05:42.337Z" },
