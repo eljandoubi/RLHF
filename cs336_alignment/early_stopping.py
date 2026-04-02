@@ -43,7 +43,9 @@ class EarlyStopping:
         self.step += 1
 
         if self.metric_name not in metrics:
-            raise ValueError(f"{self.metric_name} not found in metrics: {list(metrics.keys())}")
+            raise ValueError(
+                f"{self.metric_name} not found in metrics: {list(metrics.keys())}"
+            )
 
         raw_value = metrics[self.metric_name]
         self.metric_window.append(raw_value)

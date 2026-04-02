@@ -4,7 +4,7 @@ class SummableDict(dict):
         for key, value in self.items():
             if isinstance(value, dict):
                 self[key] = SummableDict(value)
-    
+
     def __add__(self, other: dict) -> "SummableDict":
         if not isinstance(other, dict):
             return NotImplemented
@@ -16,7 +16,7 @@ class SummableDict(dict):
             else:
                 result[key] = value
         return result
-    
+
     def __truediv__(self, divisor: float) -> "SummableDict":
         if divisor == 0:
             raise ValueError("Divisor cannot be zero.")
@@ -25,8 +25,7 @@ class SummableDict(dict):
             if hasattr(value, "__truediv__"):
                 result[key] = value / divisor
         return result
-    
-    
+
 
 def dict_mean(list_of_dicts: list[dict], only_sum: bool = False) -> SummableDict:
     if not list_of_dicts:

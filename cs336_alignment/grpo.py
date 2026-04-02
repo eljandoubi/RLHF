@@ -41,8 +41,8 @@ def compute_group_normalized_rewards(
     group_size: int,
     advantage_eps: float,
     normalize_by_std: bool,
-    processes: int | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    processes: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """
     Compute rewards for each group of rollout responses, normalized by the group size.
     Args:
@@ -80,25 +80,30 @@ def compute_group_normalized_rewards(
         advantages = (rewards - mean_rewards) / (std_rewards + advantage_eps)
     else:
         advantages = rewards - mean_rewards
-    return (advantages.view(-1), raw_rewards, 
-            {"mean_reward": mean_rewards.mean().item(),
-             "std_reward": rewards.std().item(),
-             "max_reward": rewards.max().item(),
-             "min_reward": rewards.min().item(),
-             "mean_format_reward": format_rewards.mean().item(),
-             "std_format_reward": format_rewards.std().item(),
-             "max_format_reward": format_rewards.max().item(),
-             "min_format_reward": format_rewards.min().item(),
-             "std_answer_reward": answer_rewards.std().item(),
-             "max_answer_reward": answer_rewards.max().item(),
-             "min_answer_reward": answer_rewards.min().item(),
-             "mean_answer_reward": answer_rewards.mean().item(),
-            })
+    return (
+        advantages.view(-1),
+        raw_rewards,
+        {
+            "mean_reward": mean_rewards.mean().item(),
+            "std_reward": rewards.std().item(),
+            "max_reward": rewards.max().item(),
+            "min_reward": rewards.min().item(),
+            "mean_format_reward": format_rewards.mean().item(),
+            "std_format_reward": format_rewards.std().item(),
+            "max_format_reward": format_rewards.max().item(),
+            "min_format_reward": format_rewards.min().item(),
+            "std_answer_reward": answer_rewards.std().item(),
+            "max_answer_reward": answer_rewards.max().item(),
+            "min_answer_reward": answer_rewards.min().item(),
+            "mean_answer_reward": answer_rewards.mean().item(),
+        },
+    )
+
 
 def compute_naive_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
-    ) -> torch.Tensor:
+) -> torch.Tensor:
     """
     Compute the policy-gradient loss at every token, where raw_rewards_or_advantages is either
     the raw reward or an already-normalized advantage.
@@ -113,12 +118,13 @@ def compute_naive_policy_gradient_loss(
     """
     return -raw_rewards_or_advantages * policy_log_probs
 
+
 def compute_grpo_clip_loss(
     advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
     cliprange: float,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Args:
     advantages: torch.Tensor Shape (batch_size, 1), per-example advantages A.
@@ -135,8 +141,8 @@ def compute_grpo_clip_loss(
     token was clipped or not, i.e., whether the clipped policy gradient loss on the RHS of
     the min was lower than the LHS.
     """
-    if advantages.ndim==1:
-        advantages = advantages.view(-1,1)
+    if advantages.ndim == 1:
+        advantages = advantages.view(-1, 1)
 
     ratio = torch.exp(policy_log_probs - old_log_probs)
     clipped_ratio = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
@@ -147,6 +153,7 @@ def compute_grpo_clip_loss(
         metadata = {"clipped": (loss1.detach() >= loss2.detach()).float().mean().item()}
     return loss, metadata
 
+
 def compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
@@ -154,7 +161,7 @@ def compute_policy_gradient_loss(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Select and compute the desired policy-gradient loss.
     Args:
@@ -178,13 +185,17 @@ def compute_policy_gradient_loss(
             raw_rewards_or_advantages=raw_rewards, policy_log_probs=policy_log_probs
         )
     elif loss_type == "reinforce_with_baseline":
-        assert advantages is not None, "advantages are required for reinforce with baseline loss"
+        assert advantages is not None, (
+            "advantages are required for reinforce with baseline loss"
+        )
         loss = compute_naive_policy_gradient_loss(
             raw_rewards_or_advantages=advantages, policy_log_probs=policy_log_probs
         )
     elif loss_type == "grpo_clip":
         assert advantages is not None, "advantages are required for GRPO-Clip loss"
-        assert old_log_probs is not None, "old_log_probs are required for GRPO-Clip loss"
+        assert old_log_probs is not None, (
+            "old_log_probs are required for GRPO-Clip loss"
+        )
         assert cliprange is not None, "cliprange is required for GRPO-Clip loss"
         loss, metadata = compute_grpo_clip_loss(
             advantages=advantages,
@@ -197,11 +208,12 @@ def compute_policy_gradient_loss(
 
     return loss, metadata
 
+
 def masked_mean(
     tensor: torch.Tensor,
     mask: torch.Tensor,
     dim: int | None = None,
-    ) -> torch.Tensor:
+) -> torch.Tensor:
     """
     Compute the mean of tensor along a given dimension, considering only those elements where
     mask == 1.
@@ -228,7 +240,7 @@ def grpo_microbatch_train_step(
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     scaler: GradScaler | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Execute a forward-and-backward pass on a microbatch.
     Args:
@@ -249,7 +261,9 @@ def grpo_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
         might want to log.
     """
-    context_manager = nullcontext() if scaler is None else  autocast(dtype=torch.bfloat16)
+    context_manager = (
+        nullcontext() if scaler is None else autocast(dtype=torch.bfloat16)
+    )
     with context_manager:
         loss, metadata = compute_policy_gradient_loss(
             policy_log_probs=policy_log_probs,
@@ -259,39 +273,50 @@ def grpo_microbatch_train_step(
             old_log_probs=old_log_probs,
             cliprange=cliprange,
         )
-        loss = masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
+        loss = (
+            masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
+        )
     if scaler is None:
         loss.backward()
     else:
         scaler.scale(loss).backward()
     return loss.detach(), metadata
 
-def get_rollout_logprobs(outputs:list[RequestOutput]) -> torch.Tensor:
-    rollout_logprobs = [  ([0.0] *(len(ref_gen.prompt_token_ids)-1)
-                           +[next(iter(pb.values())).logprob 
-                                    for pb in out.logprobs])
-                         for ref_gen in outputs 
-                         for out in ref_gen.outputs]
+
+def get_rollout_logprobs(outputs: list[RequestOutput]) -> torch.Tensor:
+    rollout_logprobs = [
+        (
+            [0.0] * (len(ref_gen.prompt_token_ids) - 1)
+            + [next(iter(pb.values())).logprob for pb in out.logprobs]
+        )
+        for ref_gen in outputs
+        for out in ref_gen.outputs
+    ]
 
     old_logprobs = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(m) for m in rollout_logprobs], 
-            batch_first=True, padding_value=0.0
-        )
+        [torch.tensor(m) for m in rollout_logprobs], batch_first=True, padding_value=0.0
+    )
     return old_logprobs
 
-def prepare_mask(outputs:list[RequestOutput], device: torch.device) -> torch.Tensor:
+
+def prepare_mask(outputs: list[RequestOutput], device: torch.device) -> torch.Tensor:
 
     return torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor([0]*(len(ref_gen.prompt_token_ids)-1) + [1]*len(out.token_ids)) 
-             for ref_gen in outputs for out in ref_gen.outputs],
-            batch_first=True, padding_value=0
-        ).to(device=device,dtype=torch.bool)
-    
+        [
+            torch.tensor(
+                [0] * (len(ref_gen.prompt_token_ids) - 1) + [1] * len(out.token_ids)
+            )
+            for ref_gen in outputs
+            for out in ref_gen.outputs
+        ],
+        batch_first=True,
+        padding_value=0,
+    ).to(device=device, dtype=torch.bool)
 
 
 def get_policy_log_probs(
     policy: PreTrainedModel,
-    outputs:list[RequestOutput],
+    outputs: list[RequestOutput],
     pad_token_id: int,
     micro_batch_size: int | None = None,
     use_liger: bool = False,
@@ -300,45 +325,56 @@ def get_policy_log_probs(
     Get per-token log probabilities from the policy for the given inputs,
     optimized for a training loop.
     """
-    seq_ids = torch.nn.utils.rnn.pad_sequence(
-            [torch.as_tensor(ref_gen.prompt_token_ids + list(out.token_ids),
-                             dtype=torch.long)
-             for ref_gen in outputs
-             for out in ref_gen.outputs], 
-            batch_first=True, padding_value=pad_token_id
-        ).long().to(policy.device)
+    seq_ids = (
+        torch.nn.utils.rnn.pad_sequence(
+            [
+                torch.as_tensor(
+                    ref_gen.prompt_token_ids + list(out.token_ids), dtype=torch.long
+                )
+                for ref_gen in outputs
+                for out in ref_gen.outputs
+            ],
+            batch_first=True,
+            padding_value=pad_token_id,
+        )
+        .long()
+        .to(policy.device)
+    )
     attention_mask = (seq_ids != pad_token_id).long()
     if use_liger:
-        p_outputs = policy(input_ids=seq_ids[:,:-1],
-                attention_mask=attention_mask[:,:-1],
-                labels=seq_ids[:,1:],
-                skip_logits=True,
-                reduction='none')
-        return -p_outputs.loss.reshape(len(outputs),-1)
+        p_outputs = policy(
+            input_ids=seq_ids[:, :-1],
+            attention_mask=attention_mask[:, :-1],
+            labels=seq_ids[:, 1:],
+            skip_logits=True,
+            reduction="none",
+        )
+        return -p_outputs.loss.reshape(len(outputs), -1)
 
     log_probs_list = []
     for i in range(0, seq_ids.size(0), micro_batch_size):
-        chunk = seq_ids[i:i+micro_batch_size]
+        chunk = seq_ids[i : i + micro_batch_size]
         input_chunk = chunk[:, :-1]
-        mask_chunk = attention_mask[i:i+micro_batch_size, :-1]
+        mask_chunk = attention_mask[i : i + micro_batch_size, :-1]
         labels_chunk = chunk[:, 1:]
 
+        logits_chunk: torch.Tensor = policy(
+            input_ids=input_chunk, attention_mask=mask_chunk
+        ).logits
 
-        logits_chunk: torch.Tensor = policy(input_ids=input_chunk,
-                                            attention_mask=mask_chunk).logits
-        
         log_probs_chunk = -F.cross_entropy(
             logits_chunk.reshape(-1, logits_chunk.size(-1)),
             labels_chunk.reshape(-1),
-            reduction='none',
-            ignore_index=pad_token_id
+            reduction="none",
+            ignore_index=pad_token_id,
         ).reshape(labels_chunk.shape)
-        
+
         log_probs_list.append(log_probs_chunk)
-    
+
     # Concatenate the final, small tensors
     all_log_probs = torch.cat(log_probs_list, dim=0)
     return all_log_probs
+
 
 def grpo_training(args: Namespace):
     """
@@ -346,16 +382,18 @@ def grpo_training(args: Namespace):
     following the general structure of the SFT training loop in sft.py, but replacing the loss
     computation with calls to the above functions.
     """
-    assert args.loss_type in ["no_baseline", "reinforce_with_baseline", "grpo_clip"], f"Invalid loss type: {args.loss_type}"
+    assert args.loss_type in ["no_baseline", "reinforce_with_baseline", "grpo_clip"], (
+        f"Invalid loss type: {args.loss_type}"
+    )
     assert args.train_batch_size % args.gradient_accumulation_steps == 0, (
-    "train_batch_size must be divisible by gradient_accumulation_steps"
+        "train_batch_size must be divisible by gradient_accumulation_steps"
     )
     micro_train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
     assert args.train_batch_size % args.group_size == 0, (
-    "train_batch_size must be divisible by group_size"
+        "train_batch_size must be divisible by group_size"
     )
     assert args.train_batch_size >= args.group_size, (
-    "train_batch_size must be greater than or equal to group_size"
+        "train_batch_size must be greater than or equal to group_size"
     )
     if args.use_liger:
         CausalLM = AutoLigerKernelForCausalLM
@@ -370,13 +408,11 @@ def grpo_training(args: Namespace):
         policy.gradient_checkpointing_enable()
     else:
         policy.gradient_checkpointing_disable()
-    
+
     optimizer_cls = get_optimizer(args.optimizer)
     scaler = GradScaler() if args.use_scaler else None
     optimizer: torch.optim.Optimizer = optimizer_cls(
-        policy.parameters(), lr=args.learning_rate,
-        weight_decay=0.0,
-        betas=(0.9, 0.95)
+        policy.parameters(), lr=args.learning_rate, weight_decay=0.0, betas=(0.9, 0.95)
     )
     tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.tokenizer_id)
     ref_model = init_vllm(
@@ -392,7 +428,9 @@ def grpo_training(args: Namespace):
         min_tokens=args.sampling_min_tokens,
         stop=["</answer>"],
         include_stop_str_in_output=True,
-        logprobs=1 if args.loss_type == "grpo_clip" else None,  # We need old_log_probs for GRPO-Clip loss
+        logprobs=1
+        if args.loss_type == "grpo_clip"
+        else None,  # We need old_log_probs for GRPO-Clip loss
         n=args.group_size,
     )
 
@@ -427,11 +465,12 @@ def grpo_training(args: Namespace):
     mean_metadata = SummableDict()
     counter = 0
     parallel_reward_fn = ParallelMapper(r1_zero_reward_fn, processes=args.num_proc)
-    eval_log_core = ParallelMapper(partial(core_log_gen,return_objects="only_sum"),
-                                   processes=args.num_proc)
-    parallel_log_core = ParallelMapper(partial(core_log_gen,return_objects="both"),
-                                   processes=args.num_proc)
-    
+    eval_log_core = ParallelMapper(
+        partial(core_log_gen, return_objects="only_sum"), processes=args.num_proc
+    )
+    parallel_log_core = ParallelMapper(
+        partial(core_log_gen, return_objects="both"), processes=args.num_proc
+    )
 
     early_stopper = EarlyStopping(
         metric_name=args.early_stopping_metric,
@@ -455,17 +494,20 @@ def grpo_training(args: Namespace):
             if step % args.eval_step == 0:
                 tqdm.write(f"Evaluating at step {step}...")
                 clear_device_cache(garbage_collection=True)
-                avg_scores =  SummableDict()
-                for eval_samples in tqdm(eval_dataset.iter(batch_size=args.eval_batch_size), desc="Evaluating",
-                                         total=eval_step_per_epoch):
+                avg_scores = SummableDict()
+                for eval_samples in tqdm(
+                    eval_dataset.iter(batch_size=args.eval_batch_size),
+                    desc="Evaluating",
+                    total=eval_step_per_epoch,
+                ):
                     avg_scores += log_generations(
-                            model=ref_model,
-                            prompts=eval_samples["prompt"],
-                            ground_truths=eval_samples["response"],
-                            parallel_core=eval_log_core,
-                            sampling_params=eval_sampling_params,
-                            return_objects="only_sum",
-                        )["only_sum"]
+                        model=ref_model,
+                        prompts=eval_samples["prompt"],
+                        ground_truths=eval_samples["response"],
+                        parallel_core=eval_log_core,
+                        sampling_params=eval_sampling_params,
+                        return_objects="only_sum",
+                    )["only_sum"]
 
                 num_samples = avg_scores.pop("num_samples", 1)
                 avg_scores = avg_scores / num_samples
@@ -473,11 +515,11 @@ def grpo_training(args: Namespace):
                 for metric, score in avg_scores.items():
                     tqdm.write(f"  {metric}: {score:.4f}")
                 wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
-                
+
                 save_path = f"{args.output_dir}/checkpoint-{step}"
                 policy.save_pretrained(save_path)
                 tqdm.write(f"Saved checkpoint to {save_path}")
-                
+
                 stop, es_info = early_stopper.update(avg_scores, model=policy)
 
                 tqdm.write(
@@ -499,15 +541,19 @@ def grpo_training(args: Namespace):
                     tqdm.write("Early stopping triggered.")
                     return
 
-            prompts:list[str] = samples["prompt"]
-            ground_truths:list[str] = samples["response"]
-            repeated_ground_truths = [gt for gt in ground_truths for _ in range(args.group_size)]
+            prompts: list[str] = samples["prompt"]
+            ground_truths: list[str] = samples["response"]
+            repeated_ground_truths = [
+                gt for gt in ground_truths for _ in range(args.group_size)
+            ]
             ref_outputs = ref_model.generate(
                 prompts,
                 sampling_params=train_sampling_params,
                 use_tqdm=False,
             )
-            rollout_responses = [out.text for ref_gen in ref_outputs for out in ref_gen.outputs]
+            rollout_responses = [
+                out.text for ref_gen in ref_outputs for out in ref_gen.outputs
+            ]
             advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
                 reward_fnn=parallel_reward_fn,
                 rollout_responses=rollout_responses,
@@ -524,24 +570,25 @@ def grpo_training(args: Namespace):
             else:
                 raw_rewards = None
                 advantages = advantages.to(args.policy_device)
-            
+
             if args.loss_type == "grpo_clip":
                 cliprange = args.cliprange
-                old_log_probs = get_rollout_logprobs(ref_outputs
-                                                     ).to(args.policy_device)
+                old_log_probs = get_rollout_logprobs(ref_outputs).to(args.policy_device)
             else:
                 cliprange = None
                 old_log_probs = None
-       
-            policy_log_probs = get_policy_log_probs(policy, 
-                                                    ref_outputs,
-                                                    tokenizer.pad_token_id,
-                                                    micro_train_batch_size,
-                                                    args.use_liger)
+
+            policy_log_probs = get_policy_log_probs(
+                policy,
+                ref_outputs,
+                tokenizer.pad_token_id,
+                micro_train_batch_size,
+                args.use_liger,
+            )
 
             loss, metadata = grpo_microbatch_train_step(
                 policy_log_probs=policy_log_probs,
-                response_mask=prepare_mask(ref_outputs,args.policy_device),
+                response_mask=prepare_mask(ref_outputs, args.policy_device),
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 loss_type=args.loss_type,
                 raw_rewards=raw_rewards,
@@ -554,19 +601,19 @@ def grpo_training(args: Namespace):
             counter += 1
             progress_bar.set_postfix({"loss": loss.item()})
             progress_bar.update(1)
-            
+
             if step % args.gradient_accumulation_steps == 0:
                 if args.use_scaler:
                     # Unscale gradients before clipping
                     scaler.unscale_(optimizer)
-                    
+
                     torch.nn.utils.clip_grad_norm_(
                         policy.parameters(), max_norm=args.max_grad_norm
                     )
-                    
+
                     # scaler.step() performs the optimizer step
                     scaler.step(optimizer)
-                    
+
                     # Update the scale for the next iteration
                     scaler.update()
                 else:
@@ -575,7 +622,7 @@ def grpo_training(args: Namespace):
                         policy.parameters(), max_norm=args.max_grad_norm
                     )
                     optimizer.step()
-            
+
                 # Reset gradients for the next accumulation cycle
                 optimizer.zero_grad()
 
@@ -612,7 +659,7 @@ def grpo_training(args: Namespace):
                     tqdm.write(f"Sample Entropy: {sample['sample_entropy']}")
                     tqdm.write(f"Response Length: {sample['response_len']}")
                     tqdm.write("-----")
-            
+
 
 def main():
     argparser = ArgumentParser(description="GRPO Training")
@@ -739,7 +786,7 @@ def main():
         "--advantage_eps",
         type=float,
         default=1e-6,
-        help="Small constant to avoid division by zero in normalization."
+        help="Small constant to avoid division by zero in normalization.",
     )
     argparser.add_argument(
         "--metadata_wandb_log_step",

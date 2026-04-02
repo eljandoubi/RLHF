@@ -4,8 +4,12 @@ from multiprocess import cpu_count, get_context
 
 
 class ParallelMapper:
-    def __init__(self, func:Callable, processes:Optional[int]=None, 
-                 chunksize:Optional[int]=None):
+    def __init__(
+        self,
+        func: Callable,
+        processes: Optional[int] = None,
+        chunksize: Optional[int] = None,
+    ):
         self.func = func
         self.processes = processes or cpu_count()
         self.chunksize = chunksize

@@ -56,8 +56,6 @@ def test_compute_group_normalized_rewards_no_normalize_by_std(
     numpy_snapshot.assert_match(output)
 
 
-
-
 def test_compute_naive_policy_gradient_loss(
     numpy_snapshot,
     raw_rewards_or_advantages,

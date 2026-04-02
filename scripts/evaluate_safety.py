@@ -11,6 +11,7 @@ python scripts/evaluate_safety.py \
     --output-path <path_to_write_output.jsonl>
 ```
 """
+
 import argparse
 import json
 import logging

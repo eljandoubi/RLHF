@@ -26,6 +26,7 @@ from cs336_alignment.utils import format_sample
 
 r1_zero_reward_fn = partial(r1_zero_reward_fn, fast=False)
 
+
 def tokenize_prompt_and_output(
     prompt_strs: list[str], output_strs: list[str], tokenizer: PreTrainedTokenizer
 ) -> dict[str, torch.Tensor]:
@@ -201,10 +202,15 @@ def sft_microbatch_train_step(
         }
     return loss, metadata
 
-def core_log_gen(response:RequestOutput, ground_truth:str, prompt:str|None=None,
-                 reward_fn: Callable[[str, str], dict[str, float]]=r1_zero_reward_fn,
-                 return_objects: Literal["samples", "stats", "both","only_sum"] = "both"):
-    
+
+def core_log_gen(
+    response: RequestOutput,
+    ground_truth: str,
+    prompt: str | None = None,
+    reward_fn: Callable[[str, str], dict[str, float]] = r1_zero_reward_fn,
+    return_objects: Literal["samples", "stats", "both", "only_sum"] = "both",
+):
+
     response_text = response.outputs[0].text
 
     reward_dict = reward_fn(response_text, ground_truth)
@@ -217,21 +223,21 @@ def core_log_gen(response:RequestOutput, ground_truth:str, prompt:str|None=None,
     else:
         smp_ent = 0.0
 
-    sample =             {
+    sample = {
+        "reward": reward_dict.get("reward", 0.0),
+        "format_reward": reward_dict.get("format_reward", 0.0),
+        "answer_reward": reward_dict.get("answer_reward", 0.0),
+        "sample_entropy": smp_ent,
+        "response_len": response_len,
+    }
 
-            "reward": reward_dict.get("reward", 0.0),
-            "format_reward": reward_dict.get("format_reward", 0.0),
-            "answer_reward": reward_dict.get("answer_reward", 0.0),
-            "sample_entropy": smp_ent,
-            "response_len": response_len,
-        }
-    
     if return_objects in ["samples", "both"]:
         sample["prompt"] = prompt
         sample["response"] = response_text
         sample["ground_truth"] = ground_truth
 
     return sample
+
 
 def log_generations(
     model: LLM,
@@ -240,7 +246,7 @@ def log_generations(
     parallel_core: ParallelMapper,
     sampling_params: SamplingParams,
     num_log: int | None = None,
-    return_objects: Literal["samples", "stats", "both","only_sum"] = "both",
+    return_objects: Literal["samples", "stats", "both", "only_sum"] = "both",
 ) -> dict[str, Any]:
     """
     Generate responses for a few prompts and log:
@@ -266,7 +272,7 @@ def log_generations(
         samples = parallel_core.map(responses, ground_truths, prompts)
         if return_objects == "both":
             return {"samples": samples, "stats": dict_mean(samples)}
-        
+
         return {"samples": samples}
     else:
         samples = parallel_core.map(responses, ground_truths)
@@ -414,30 +420,35 @@ def sft_training(args: Namespace):
     progress_bar = tqdm(total=total_steps, desc="SFT Training")
     mean_metadata = SummableDict()
     counter = 0
-    eval_log_core = ParallelMapper(partial(core_log_gen,return_objects="only_sum"),
-                                   processes=args.num_proc)
-    parallel_log_core = ParallelMapper(partial(core_log_gen,return_objects="both"),
-                                   processes=args.num_proc)
+    eval_log_core = ParallelMapper(
+        partial(core_log_gen, return_objects="only_sum"), processes=args.num_proc
+    )
+    parallel_log_core = ParallelMapper(
+        partial(core_log_gen, return_objects="both"), processes=args.num_proc
+    )
     for i in range(args.epochs):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=args.train_batch_size)
         ):
             step = i * train_step_per_epoch + j + 1
 
-            if (step-1) % args.eval_step == 0:
+            if (step - 1) % args.eval_step == 0:
                 tqdm.write(f"Evaluating at step {step}...")
                 load_policy_into_vllm_instance(policy, ref_model)
-                avg_scores =  SummableDict()
-                for eval_samples in tqdm(eval_dataset.iter(batch_size=args.eval_batch_size), desc="Evaluating",
-                                         total=eval_step_per_epoch):
+                avg_scores = SummableDict()
+                for eval_samples in tqdm(
+                    eval_dataset.iter(batch_size=args.eval_batch_size),
+                    desc="Evaluating",
+                    total=eval_step_per_epoch,
+                ):
                     avg_scores += log_generations(
-                            model=ref_model,
-                            prompts=eval_samples["prompt"],
-                            ground_truths=eval_samples["response"],
-                            parallel_core=eval_log_core,
-                            sampling_params=sampling_params,
-                            return_objects="only_sum",
-                        )["only_sum"]
+                        model=ref_model,
+                        prompts=eval_samples["prompt"],
+                        ground_truths=eval_samples["response"],
+                        parallel_core=eval_log_core,
+                        sampling_params=sampling_params,
+                        return_objects="only_sum",
+                    )["only_sum"]
 
                 num_samples = avg_scores.pop("num_samples", 1)
                 avg_scores = avg_scores / num_samples
@@ -445,7 +456,7 @@ def sft_training(args: Namespace):
                 for metric, score in avg_scores.items():
                     tqdm.write(f"  {metric}: {score:.4f}")
                 wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
-                if step>1:
+                if step > 1:
                     save_path = f"{args.output_dir}/checkpoint-{step}"
                     policy.save_pretrained(save_path)
                     tokenizer.save_pretrained(save_path)
@@ -470,7 +481,7 @@ def sft_training(args: Namespace):
             counter += 1
             progress_bar.set_postfix({"loss": loss.item()})
             progress_bar.update(1)
-            
+
             if step % args.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), max_norm=args.max_grad_norm
@@ -488,7 +499,6 @@ def sft_training(args: Namespace):
                 counter = 0
 
             if step % args.logging_step == 0:
-                
                 load_policy_into_vllm_instance(policy, ref_model)
                 clear_device_cache(garbage_collection=True)
                 log_results = log_generations(
