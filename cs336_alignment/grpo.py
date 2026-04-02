@@ -516,7 +516,6 @@ def grpo_training(args: Namespace):
         patience=args.early_stopping_patience,
         min_delta=args.early_stopping_min_delta,
         mode="max",
-        min_steps=10,  # optional warmup
         smoothing_window=3,  # helps with RL noise
         output_dir=args.output_dir,
     )
