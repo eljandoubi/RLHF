@@ -633,6 +633,7 @@ def grpo_training(args: Namespace):
                     optimizer.zero_grad()
 
                 if step % args.ref_sync_steps == 0:
+                    tqdm.write(f"Sync ref model at step {step}")
                     load_policy_into_vllm_instance(policy, ref_model)
 
                 if step % args.eval_step == 0:
