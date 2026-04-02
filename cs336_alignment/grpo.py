@@ -376,6 +376,47 @@ def get_policy_log_probs(
     return all_log_probs
 
 
+def generate_and_compute_rewards(
+    ref_model,
+    prompts,
+    ground_truths,
+    train_sampling_params,
+    parallel_reward_fn,
+    args,
+):
+    """
+    Handles Stage A: Generation and Reward Calculation.
+    This function will be run in a separate thread.
+    """
+    # 1. Generate rollouts on vLLM device (e.g., cuda:1)
+    ref_outputs = ref_model.generate(
+        prompts,
+        sampling_params=train_sampling_params,
+        use_tqdm=False,
+    )
+    rollout_responses = [
+        out.text for ref_gen in ref_outputs for out in ref_gen.outputs
+    ]
+    repeated_ground_truths = [
+        gt for gt in ground_truths for _ in range(args.group_size)
+    ]
+
+    # 2. Compute rewards on the CPU
+    advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
+        reward_fnn=parallel_reward_fn,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths,
+        group_size=args.group_size,
+        advantage_eps=args.advantage_eps,
+        normalize_by_std=args.normalize_by_std,
+        processes=args.num_proc,
+    )
+
+    # Return all the data the main training step will need
+    return ref_outputs, advantages, raw_rewards, reward_metadata
+
+
+
 def grpo_training(args: Namespace):
     """
     Main training loop for GRPO. You can structure this however you want; we suggest
