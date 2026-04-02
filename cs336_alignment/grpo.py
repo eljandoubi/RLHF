@@ -314,7 +314,7 @@ def get_policy_log_probs(
                 labels=seq_ids[:,1:],
                 skip_logits=True,
                 reduction='none')
-        return p_outputs.loss.reshape(len(outputs),-1)
+        return -p_outputs.loss.reshape(len(outputs),-1)
 
     log_probs_list = []
     for i in range(0, seq_ids.size(0), micro_batch_size):
