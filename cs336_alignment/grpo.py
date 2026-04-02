@@ -522,6 +522,87 @@ def grpo_training(args: Namespace):
         smoothing_window=3,  # helps with RL noise
         output_dir=args.output_dir,
     )
+    # Initialize the data iterator
+    train_iterator = iter(train_dataset.iter(batch_size=micro_train_batch_size))
+    
+    # Use a thread pool with one worker for our pipeline
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        # -- Pipeline Kickstart --
+        # Fetch the first batch of data and submit it for generation/reward
+        current_samples = next(train_iterator)
+        future = executor.submit(
+            generate_and_compute_rewards,
+            ref_model,
+            current_samples["prompt"],
+            current_samples["response"],
+            train_sampling_params,
+            parallel_reward_fn,
+            args,
+        )
+
+        progress_bar = tqdm(total=total_steps, desc="GRPO Training")
+        for i in range(args.epochs):
+            for j in range(train_step_per_epoch):
+                step = i * train_step_per_epoch + j + 1
+                
+                # -- Wait for the previous step's data to be ready --
+                # This call blocks until the background thread is finished.
+                # The very first time, it waits for the kickstart job.
+                ref_outputs, advantages, raw_rewards, reward_metadata = future.result()
+
+                # -- Look Ahead: Start the NEXT batch's generation/reward --
+                # While we train on the current data, the background thread will
+                # work on the next set of prompts.
+                try:
+                    next_samples = next(train_iterator)
+                    future = executor.submit(
+                        generate_and_compute_rewards,
+                        ref_model,
+                        next_samples["prompt"],
+                        next_samples["response"],
+                        train_sampling_params,
+                        parallel_reward_fn,
+                        args,
+                    )
+                except StopIteration:
+                    # Reached the end of the dataset
+                    pass
+                
+                # --- Main Training Step on cuda:0 (using the data we just received) ---
+                
+                # Move rewards/advantages to the policy device
+                if args.loss_type == "no_baseline":
+                    raw_rewards = raw_rewards.to(args.policy_device)
+                    advantages = None
+                else:
+                    raw_rewards = None
+                    advantages = advantages.to(args.policy_device)
+
+                if args.loss_type == "grpo_clip":
+                    cliprange = args.cliprange
+                    old_log_probs = get_rollout_logprobs(ref_outputs).to(args.policy_device)
+                else:
+                    cliprange = None
+                    old_log_probs = None
+
+                policy_log_probs = get_policy_log_probs(
+                    policy,
+                    ref_outputs,
+                    tokenizer.pad_token_id,
+                    micro_train_batch_size,
+                    args.use_liger,
+                )
+
+                loss, metadata = grpo_microbatch_train_step(
+                    policy_log_probs=policy_log_probs,
+                    response_mask=prepare_mask(ref_outputs, args.policy_device),
+                    # ... other args
+                    advantages=advantages,
+                    raw_rewards=raw_rewards,
+                    old_log_probs=old_log_probs,
+                    cliprange=cliprange,
+                )
+
     for i in range(args.epochs):
         for j, samples in enumerate(
             train_dataset.iter(batch_size=micro_train_batch_size)
