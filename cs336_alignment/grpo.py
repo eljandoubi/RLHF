@@ -530,11 +530,9 @@ def grpo_training(args: Namespace):
 
             if step % args.ref_sync_steps == 0:
                 load_policy_into_vllm_instance(policy, ref_model)
-                clear_device_cache(garbage_collection=True)
 
             if step % args.eval_step == 0:
                 tqdm.write(f"Evaluating at step {step}...")
-                clear_device_cache(garbage_collection=True)
                 avg_scores = SummableDict()
                 for eval_samples in tqdm(
                     eval_dataset.iter(batch_size=args.eval_batch_size),
@@ -668,7 +666,6 @@ def grpo_training(args: Namespace):
                 optimizer.zero_grad()
 
             if step % args.metadata_wandb_log_step == 0:
-                clear_device_cache(garbage_collection=True)
                 mean_metadata = mean_metadata / counter
                 tqdm.write(f"Step {step} metadata: {mean_metadata}")
                 wandb.log(
