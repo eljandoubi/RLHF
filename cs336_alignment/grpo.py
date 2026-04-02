@@ -1,4 +1,5 @@
 from argparse import ArgumentParser, Namespace
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from functools import partial
 from typing import Callable, Literal
@@ -394,9 +395,7 @@ def generate_and_compute_rewards(
         sampling_params=train_sampling_params,
         use_tqdm=False,
     )
-    rollout_responses = [
-        out.text for ref_gen in ref_outputs for out in ref_gen.outputs
-    ]
+    rollout_responses = [out.text for ref_gen in ref_outputs for out in ref_gen.outputs]
     repeated_ground_truths = [
         gt for gt in ground_truths for _ in range(args.group_size)
     ]
@@ -409,12 +408,11 @@ def generate_and_compute_rewards(
         group_size=args.group_size,
         advantage_eps=args.advantage_eps,
         normalize_by_std=args.normalize_by_std,
-        processes=args.num_proc,
+        processes=min(rollout_responses, args.num_proc),
     )
 
     # Return all the data the main training step will need
     return ref_outputs, advantages, raw_rewards, reward_metadata
-
 
 
 def grpo_training(args: Namespace):
@@ -524,7 +522,7 @@ def grpo_training(args: Namespace):
     )
     # Initialize the data iterator
     train_iterator = iter(train_dataset.iter(batch_size=micro_train_batch_size))
-    
+
     # Use a thread pool with one worker for our pipeline
     with ThreadPoolExecutor(max_workers=1) as executor:
         # -- Pipeline Kickstart --
@@ -544,7 +542,7 @@ def grpo_training(args: Namespace):
         for i in range(args.epochs):
             for j in range(train_step_per_epoch):
                 step = i * train_step_per_epoch + j + 1
-                
+
                 # -- Wait for the previous step's data to be ready --
                 # This call blocks until the background thread is finished.
                 # The very first time, it waits for the kickstart job.
@@ -567,9 +565,9 @@ def grpo_training(args: Namespace):
                 except StopIteration:
                     # Reached the end of the dataset
                     pass
-                
+
                 # --- Main Training Step on cuda:0 (using the data we just received) ---
-                
+
                 # Move rewards/advantages to the policy device
                 if args.loss_type == "no_baseline":
                     raw_rewards = raw_rewards.to(args.policy_device)
@@ -580,7 +578,9 @@ def grpo_training(args: Namespace):
 
                 if args.loss_type == "grpo_clip":
                     cliprange = args.cliprange
-                    old_log_probs = get_rollout_logprobs(ref_outputs).to(args.policy_device)
+                    old_log_probs = get_rollout_logprobs(ref_outputs).to(
+                        args.policy_device
+                    )
                 else:
                     cliprange = None
                     old_log_probs = None
@@ -596,188 +596,129 @@ def grpo_training(args: Namespace):
                 loss, metadata = grpo_microbatch_train_step(
                     policy_log_probs=policy_log_probs,
                     response_mask=prepare_mask(ref_outputs, args.policy_device),
-                    # ... other args
-                    advantages=advantages,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    loss_type=args.loss_type,
                     raw_rewards=raw_rewards,
+                    advantages=advantages,
                     old_log_probs=old_log_probs,
                     cliprange=cliprange,
                 )
+                metadata.update(reward_metadata)
+                mean_metadata += metadata
+                counter += 1
+                progress_bar.set_postfix({"loss": loss.item()})
+                progress_bar.update(1)
 
-    for i in range(args.epochs):
-        for j, samples in enumerate(
-            train_dataset.iter(batch_size=micro_train_batch_size)
-        ):
-            step = i * train_step_per_epoch + j + 1
+                if step % args.gradient_accumulation_steps == 0:
+                    if args.use_scaler:
+                        # Unscale gradients before clipping
+                        scaler.unscale_(optimizer)
 
-            if step % args.ref_sync_steps == 0:
-                load_policy_into_vllm_instance(policy, ref_model)
+                        torch.nn.utils.clip_grad_norm_(
+                            policy.parameters(), max_norm=args.max_grad_norm
+                        )
 
-            if step % args.eval_step == 0:
-                tqdm.write(f"Evaluating at step {step}...")
-                avg_scores = SummableDict()
-                for eval_samples in tqdm(
-                    eval_dataset.iter(batch_size=args.eval_batch_size),
-                    desc="Evaluating",
-                    total=eval_step_per_epoch,
-                ):
-                    avg_scores += log_generations(
+                        # scaler.step() performs the optimizer step
+                        scaler.step(optimizer)
+
+                        # Update the scale for the next iteration
+                        scaler.update()
+                    else:
+                        # Standard gradient clipping and optimizer step without a scaler
+                        torch.nn.utils.clip_grad_norm_(
+                            policy.parameters(), max_norm=args.max_grad_norm
+                        )
+                        optimizer.step()
+
+                    # Reset gradients for the next accumulation cycle
+                    optimizer.zero_grad()
+
+                if step % args.ref_sync_steps == 0:
+                    load_policy_into_vllm_instance(policy, ref_model)
+
+                if step % args.eval_step == 0:
+                    tqdm.write(f"Evaluating at step {step}...")
+                    avg_scores = SummableDict()
+                    for eval_samples in tqdm(
+                        eval_dataset.iter(batch_size=args.eval_batch_size),
+                        desc="Evaluating",
+                        total=eval_step_per_epoch,
+                    ):
+                        avg_scores += log_generations(
+                            model=ref_model,
+                            prompts=eval_samples["prompt"],
+                            ground_truths=eval_samples["response"],
+                            parallel_core=eval_log_core,
+                            sampling_params=eval_sampling_params,
+                            return_objects="only_sum",
+                        )["only_sum"]
+
+                    num_samples = avg_scores.pop("num_samples", 1)
+                    avg_scores = avg_scores / num_samples
+                    tqdm.write("Average Scores:")
+                    for metric, score in avg_scores.items():
+                        tqdm.write(f"  {metric}: {score:.4f}")
+                    wandb.log(
+                        {f"eval/{k}": v for k, v in avg_scores.items()}, step=step
+                    )
+
+                    save_path = f"{args.output_dir}/checkpoint-{step}"
+                    policy.save_pretrained(save_path)
+                    tqdm.write(f"Saved checkpoint to {save_path}")
+
+                    stop, es_info = early_stopper.update(avg_scores, model=policy)
+
+                    tqdm.write(
+                        f"[EarlyStopping] metric={es_info['smoothed_metric']:.4f}, "
+                        f"best={es_info['best_metric']:.4f}, "
+                        f"patience={es_info['patience_counter']}/{args.early_stopping_patience}"
+                    )
+
+                    wandb.log(
+                        {
+                            "early_stopping/metric": es_info["smoothed_metric"],
+                            "early_stopping/best": es_info["best_metric"],
+                            "early_stopping/patience": es_info["patience_counter"],
+                        },
+                        step=step,
+                    )
+
+                    if stop:
+                        tqdm.write("Early stopping triggered.")
+                        return
+
+                if step % args.metadata_wandb_log_step == 0:
+                    clear_device_cache(garbage_collection=True)
+                    mean_metadata = mean_metadata / counter
+                    tqdm.write(f"Step {step} metadata: {mean_metadata}")
+                    wandb.log(
+                        {f"train/{k}": v for k, v in mean_metadata.items()}, step=step
+                    )
+                    mean_metadata = SummableDict()
+                    counter = 0
+
+                if step % args.logging_step == 0:
+                    log_results = log_generations(
                         model=ref_model,
-                        prompts=eval_samples["prompt"],
-                        ground_truths=eval_samples["response"],
-                        parallel_core=eval_log_core,
+                        prompts=next_samples["prompt"],
+                        ground_truths=next_samples["response"],
+                        parallel_core=parallel_log_core,
                         sampling_params=eval_sampling_params,
-                        return_objects="only_sum",
-                    )["only_sum"]
-
-                num_samples = avg_scores.pop("num_samples", 1)
-                avg_scores = avg_scores / num_samples
-                tqdm.write("Average Scores:")
-                for metric, score in avg_scores.items():
-                    tqdm.write(f"  {metric}: {score:.4f}")
-                wandb.log({f"eval/{k}": v for k, v in avg_scores.items()}, step=step)
-
-                save_path = f"{args.output_dir}/checkpoint-{step}"
-                policy.save_pretrained(save_path)
-                tqdm.write(f"Saved checkpoint to {save_path}")
-
-                stop, es_info = early_stopper.update(avg_scores, model=policy)
-
-                tqdm.write(
-                    f"[EarlyStopping] metric={es_info['smoothed_metric']:.4f}, "
-                    f"best={es_info['best_metric']:.4f}, "
-                    f"patience={es_info['patience_counter']}/{args.early_stopping_patience}"
-                )
-
-                wandb.log(
-                    {
-                        "early_stopping/metric": es_info["smoothed_metric"],
-                        "early_stopping/best": es_info["best_metric"],
-                        "early_stopping/patience": es_info["patience_counter"],
-                    },
-                    step=step,
-                )
-
-                if stop:
-                    tqdm.write("Early stopping triggered.")
-                    return
-
-            prompts: list[str] = samples["prompt"]
-            ground_truths: list[str] = samples["response"]
-            repeated_ground_truths = [
-                gt for gt in ground_truths for _ in range(args.group_size)
-            ]
-            ref_outputs = ref_model.generate(
-                prompts,
-                sampling_params=train_sampling_params,
-                use_tqdm=False,
-            )
-            rollout_responses = [
-                out.text for ref_gen in ref_outputs for out in ref_gen.outputs
-            ]
-            advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
-                reward_fnn=parallel_reward_fn,
-                rollout_responses=rollout_responses,
-                repeated_ground_truths=repeated_ground_truths,
-                group_size=args.group_size,
-                advantage_eps=args.advantage_eps,
-                normalize_by_std=args.normalize_by_std,
-                processes=args.num_proc,
-            )
-
-            if args.loss_type == "no_baseline":
-                raw_rewards = raw_rewards.to(args.policy_device)
-                advantages = None
-            else:
-                raw_rewards = None
-                advantages = advantages.to(args.policy_device)
-
-            if args.loss_type == "grpo_clip":
-                cliprange = args.cliprange
-                old_log_probs = get_rollout_logprobs(ref_outputs).to(args.policy_device)
-            else:
-                cliprange = None
-                old_log_probs = None
-
-            policy_log_probs = get_policy_log_probs(
-                policy,
-                ref_outputs,
-                tokenizer.pad_token_id,
-                micro_train_batch_size,
-                args.use_liger,
-            )
-
-            loss, metadata = grpo_microbatch_train_step(
-                policy_log_probs=policy_log_probs,
-                response_mask=prepare_mask(ref_outputs, args.policy_device),
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
-                loss_type=args.loss_type,
-                raw_rewards=raw_rewards,
-                advantages=advantages,
-                old_log_probs=old_log_probs,
-                cliprange=cliprange,
-            )
-            metadata.update(reward_metadata)
-            mean_metadata += metadata
-            counter += 1
-            progress_bar.set_postfix({"loss": loss.item()})
-            progress_bar.update(1)
-
-            if step % args.gradient_accumulation_steps == 0:
-                if args.use_scaler:
-                    # Unscale gradients before clipping
-                    scaler.unscale_(optimizer)
-
-                    torch.nn.utils.clip_grad_norm_(
-                        policy.parameters(), max_norm=args.max_grad_norm
+                        num_log=args.num_log,
                     )
-
-                    # scaler.step() performs the optimizer step
-                    scaler.step(optimizer)
-
-                    # Update the scale for the next iteration
-                    scaler.update()
-                else:
-                    # Standard gradient clipping and optimizer step without a scaler
-                    torch.nn.utils.clip_grad_norm_(
-                        policy.parameters(), max_norm=args.max_grad_norm
-                    )
-                    optimizer.step()
-
-                # Reset gradients for the next accumulation cycle
-                optimizer.zero_grad()
-
-            if step % args.metadata_wandb_log_step == 0:
-                mean_metadata = mean_metadata / counter
-                tqdm.write(f"Step {step} metadata: {mean_metadata}")
-                wandb.log(
-                    {f"train/{k}": v for k, v in mean_metadata.items()}, step=step
-                )
-                mean_metadata = SummableDict()
-                counter = 0
-
-            if step % args.logging_step == 0:
-                clear_device_cache(garbage_collection=True)
-                log_results = log_generations(
-                    model=ref_model,
-                    prompts=samples["prompt"],
-                    ground_truths=samples["response"],
-                    parallel_core=parallel_log_core,
-                    sampling_params=eval_sampling_params,
-                    num_log=args.num_log,
-                )
-                tqdm.write(f"Logging generations at step {step}:")
-                tqdm.write(f"Stats: {log_results['stats']}")
-                tqdm.write("Samples:")
-                for sample in log_results["samples"]:
-                    tqdm.write(f"Prompt: {sample['prompt']}")
-                    tqdm.write(f"Response: {sample['response']}")
-                    tqdm.write(f"Ground Truth: {sample['ground_truth']}")
-                    tqdm.write(f"Reward: {sample['reward']}")
-                    tqdm.write(f"Format Reward: {sample['format_reward']}")
-                    tqdm.write(f"Answer Reward: {sample['answer_reward']}")
-                    tqdm.write(f"Sample Entropy: {sample['sample_entropy']}")
-                    tqdm.write(f"Response Length: {sample['response_len']}")
-                    tqdm.write("-----")
+                    tqdm.write(f"Logging generations at step {step}:")
+                    tqdm.write(f"Stats: {log_results['stats']}")
+                    tqdm.write("Samples:")
+                    for sample in log_results["samples"]:
+                        tqdm.write(f"Prompt: {sample['prompt']}")
+                        tqdm.write(f"Response: {sample['response']}")
+                        tqdm.write(f"Ground Truth: {sample['ground_truth']}")
+                        tqdm.write(f"Reward: {sample['reward']}")
+                        tqdm.write(f"Format Reward: {sample['format_reward']}")
+                        tqdm.write(f"Answer Reward: {sample['answer_reward']}")
+                        tqdm.write(f"Sample Entropy: {sample['sample_entropy']}")
+                        tqdm.write(f"Response Length: {sample['response_len']}")
+                        tqdm.write("-----")
 
 
 def main():
@@ -910,19 +851,19 @@ def main():
     argparser.add_argument(
         "--metadata_wandb_log_step",
         type=int,
-        default=10000,
+        default=1000,
         help="Number of steps between logging metadata to Weights & Biases",
     )
     argparser.add_argument(
         "--eval_step",
         type=int,
-        default=100000,
+        default=10000,
         help="Number of steps between evaluations",
     )
     argparser.add_argument(
         "--logging_step",
         type=int,
-        default=50000,
+        default=5000,
         help="Number of steps between logging generations",
     )
     argparser.add_argument(
