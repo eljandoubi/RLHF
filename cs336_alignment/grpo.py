@@ -1,10 +1,12 @@
 from argparse import ArgumentParser, Namespace
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from functools import partial
 from typing import Callable, Literal
 
 import torch
+import wandb
 from accelerate.utils.memory import clear_device_cache
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from torch.amp import GradScaler, autocast
@@ -18,7 +20,6 @@ from transformers import (
 )
 from vllm import RequestOutput, SamplingParams
 
-import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.early_stopping import EarlyStopping
 from cs336_alignment.parallel_mapper import ParallelMapper
@@ -519,51 +520,65 @@ def grpo_training(args: Namespace):
         smoothing_window=3,  # helps with RL noise
         output_dir=args.output_dir,
     )
-    # Initialize the data iterator
-    train_iterator = iter(train_dataset.iter(batch_size=micro_train_batch_size))
-
-    # Use a thread pool with one worker for our pipeline
+    # Use a thread pool with one worker for our pipeline.
+    # We queue up `prefetch_size` jobs so the worker always has work
+    # waiting, eliminating idle gaps between generation batches.
     with ThreadPoolExecutor(max_workers=1) as executor:
-        # -- Pipeline Kickstart --
-        # Fetch the first batch of data and submit it for generation/reward
-        current_samples = next(train_iterator)
-        future = executor.submit(
-            generate_and_compute_rewards,
-            ref_model,
-            current_samples["prompt"],
-            current_samples["response"],
-            train_sampling_params,
-            parallel_reward_fn,
-            args,
-        )
-
         progress_bar = tqdm(total=total_steps, desc="GRPO Training")
         for i in range(args.epochs):
+            train_iterator = iter(train_dataset.iter(batch_size=micro_train_batch_size))
+
+            # -- Pipeline Kickstart: fill the prefetch queue --
+            prefetch_queue: deque[tuple[dict, object]] = deque()
+            for _ in range(args.prefetch_size):
+                try:
+                    samples = next(train_iterator)
+                    prefetch_queue.append(
+                        (
+                            samples,
+                            executor.submit(
+                                generate_and_compute_rewards,
+                                ref_model,
+                                samples["prompt"],
+                                samples["response"],
+                                train_sampling_params,
+                                parallel_reward_fn,
+                                args,
+                            ),
+                        )
+                    )
+                except StopIteration:
+                    break
+
             for j in range(train_step_per_epoch):
                 step = i * train_step_per_epoch + j + 1
 
-                # -- Wait for the previous step's data to be ready --
-                # This call blocks until the background thread is finished.
-                # The very first time, it waits for the kickstart job.
+                if not prefetch_queue:
+                    break  # No more data for this epoch
+
+                # -- Pop the oldest prefetched result --
+                current_samples, future = prefetch_queue.popleft()
                 ref_outputs, advantages, raw_rewards, reward_metadata = future.result()
 
-                # -- Look Ahead: Start the NEXT batch's generation/reward --
-                # While we train on the current data, the background thread will
-                # work on the next set of prompts.
+                # -- Refill: enqueue the next batch to keep the queue full --
                 try:
                     next_samples = next(train_iterator)
-                    future = executor.submit(
-                        generate_and_compute_rewards,
-                        ref_model,
-                        next_samples["prompt"],
-                        next_samples["response"],
-                        train_sampling_params,
-                        parallel_reward_fn,
-                        args,
+                    prefetch_queue.append(
+                        (
+                            next_samples,
+                            executor.submit(
+                                generate_and_compute_rewards,
+                                ref_model,
+                                next_samples["prompt"],
+                                next_samples["response"],
+                                train_sampling_params,
+                                parallel_reward_fn,
+                                args,
+                            ),
+                        )
                     )
                 except StopIteration:
-                    # Reached the end of the dataset
-                    pass
+                    pass  # Iterator exhausted; drain remaining queue
 
                 # --- Main Training Step on cuda:0 (using the data we just received) ---
 
@@ -700,8 +715,8 @@ def grpo_training(args: Namespace):
                 if step % args.logging_step == 0:
                     log_results = log_generations(
                         model=ref_model,
-                        prompts=next_samples["prompt"],
-                        ground_truths=next_samples["response"],
+                        prompts=current_samples["prompt"],
+                        ground_truths=current_samples["response"],
                         parallel_core=parallel_log_core,
                         sampling_params=eval_sampling_params,
                         num_log=args.num_log,
@@ -916,6 +931,14 @@ def main():
         type=float,
         default=1.0,
         help="Maximum gradient norm for clipping",
+    )
+    argparser.add_argument(
+        "--prefetch_size",
+        type=int,
+        default=2,
+        help="Number of generation/reward batches to prefetch ahead of training. "
+        "Higher values reduce idle time between batches at the cost of more memory "
+        "and slightly staler policy weights for prefetched generations.",
     )
     args = argparser.parse_args()
     wandb.login()
