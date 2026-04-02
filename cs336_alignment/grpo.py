@@ -1,7 +1,8 @@
 from argparse import ArgumentParser, Namespace
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal
 
@@ -316,33 +317,151 @@ def prepare_mask(outputs: list[RequestOutput], device: torch.device) -> torch.Te
     ).to(device=device, dtype=torch.bool)
 
 
+@dataclass
+class RolloutTensors:
+    """Pre-computed tensors from a rollout, built once and reused."""
+
+    seq_ids: torch.Tensor  # (batch, max_seq_len) on CPU, pinned
+    attention_mask: torch.Tensor  # (batch, max_seq_len) on CPU, pinned
+    response_mask: torch.Tensor  # (batch, max_seq_len-1) bool, on CPU, pinned
+    old_log_probs: torch.Tensor | None  # (batch, max_seq_len-1) on CPU, pinned
+
+
+def prepare_rollout_tensors(
+    outputs: list[RequestOutput],
+    pad_token_id: int,
+    need_old_logprobs: bool,
+) -> RolloutTensors:
+    """
+    One-shot tokenization + padding for all downstream consumers.
+    Returns CPU tensors in pinned memory for fast async H2D transfer.
+    """
+    # Build full sequences (prompt + response) for every rollout
+    sequences = [
+        torch.as_tensor(
+            ref_gen.prompt_token_ids + list(out.token_ids), dtype=torch.long
+        )
+        for ref_gen in outputs
+        for out in ref_gen.outputs
+    ]
+    seq_ids = torch.nn.utils.rnn.pad_sequence(
+        sequences, batch_first=True, padding_value=pad_token_id
+    ).long()
+    attention_mask = (seq_ids != pad_token_id).long()
+
+    # Response mask: 0 for prompt tokens, 1 for response tokens (shifted by 1 for labels)
+    response_mask = torch.nn.utils.rnn.pad_sequence(
+        [
+            torch.tensor(
+                [0] * (len(ref_gen.prompt_token_ids) - 1) + [1] * len(out.token_ids)
+            )
+            for ref_gen in outputs
+            for out in ref_gen.outputs
+        ],
+        batch_first=True,
+        padding_value=0,
+    ).bool()
+
+    # Old log-probs from vLLM (for GRPO-clip)
+    old_log_probs = None
+    if need_old_logprobs:
+        rollout_lp = [
+            (
+                [0.0] * (len(ref_gen.prompt_token_ids) - 1)
+                + [next(iter(pb.values())).logprob for pb in out.logprobs]
+            )
+            for ref_gen in outputs
+            for out in ref_gen.outputs
+        ]
+        old_log_probs = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(m) for m in rollout_lp],
+            batch_first=True,
+            padding_value=0.0,
+        )
+
+    # Pin all tensors for fast non-blocking H2D transfer
+    seq_ids = seq_ids.pin_memory()
+    attention_mask = attention_mask.pin_memory()
+    response_mask = response_mask.pin_memory()
+    if old_log_probs is not None:
+        old_log_probs = old_log_probs.pin_memory()
+
+    return RolloutTensors(
+        seq_ids=seq_ids,
+        attention_mask=attention_mask,
+        response_mask=response_mask,
+        old_log_probs=old_log_probs,
+    )
+
+
+def generate_rollouts(
+    ref_model,
+    prompts,
+    train_sampling_params,
+):
+    """Stage 1 (GPU-bound): generate rollouts on the vLLM device."""
+    return ref_model.generate(
+        prompts,
+        sampling_params=train_sampling_params,
+        use_tqdm=False,
+    )
+
+
+def score_rollouts(
+    ref_outputs: list[RequestOutput],
+    ground_truths: list[str],
+    parallel_reward_fn: ParallelMapper,
+    pad_token_id: int,
+    args: Namespace,
+):
+    """
+    Stage 2 (CPU-bound): compute rewards + pre-tokenize rollout tensors.
+    Returns (advantages, raw_rewards, reward_metadata, rollout_tensors).
+    """
+    rollout_responses = [out.text for ref_gen in ref_outputs for out in ref_gen.outputs]
+    repeated_ground_truths = [
+        gt for gt in ground_truths for _ in range(args.group_size)
+    ]
+
+    advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
+        reward_fnn=parallel_reward_fn,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths,
+        group_size=args.group_size,
+        advantage_eps=args.advantage_eps,
+        normalize_by_std=args.normalize_by_std,
+        processes=min(len(rollout_responses), args.num_proc),
+    )
+
+    # Pin rewards for fast H2D transfer
+    advantages = advantages.pin_memory()
+    raw_rewards = raw_rewards.pin_memory()
+
+    # Pre-tokenize everything once
+    rollout_tensors = prepare_rollout_tensors(
+        ref_outputs,
+        pad_token_id=pad_token_id,
+        need_old_logprobs=(args.loss_type == "grpo_clip"),
+    )
+
+    return advantages, raw_rewards, reward_metadata, rollout_tensors
+
+
 def get_policy_log_probs(
     policy: PreTrainedModel,
-    outputs: list[RequestOutput],
+    rollout_tensors: RolloutTensors,
     pad_token_id: int,
     micro_batch_size: int | None = None,
     use_liger: bool = False,
 ) -> torch.Tensor:
     """
     Get per-token log probabilities from the policy for the given inputs,
-    optimized for a training loop.
+    using pre-computed, pinned tensors for fast non-blocking transfer.
     """
-    seq_ids = (
-        torch.nn.utils.rnn.pad_sequence(
-            [
-                torch.as_tensor(
-                    ref_gen.prompt_token_ids + list(out.token_ids), dtype=torch.long
-                )
-                for ref_gen in outputs
-                for out in ref_gen.outputs
-            ],
-            batch_first=True,
-            padding_value=pad_token_id,
-        )
-        .long()
-        .to(policy.device)
-    )
-    attention_mask = (seq_ids != pad_token_id).long()
+    device = policy.device
+    seq_ids = rollout_tensors.seq_ids.to(device, non_blocking=True)
+    attention_mask = rollout_tensors.attention_mask.to(device, non_blocking=True)
+
     if use_liger:
         p_outputs = policy(
             input_ids=seq_ids[:, :-1],
@@ -373,47 +492,8 @@ def get_policy_log_probs(
 
         log_probs_list.append(log_probs_chunk)
 
-    # Concatenate the final, small tensors
     all_log_probs = torch.cat(log_probs_list, dim=0)
     return all_log_probs
-
-
-def generate_and_compute_rewards(
-    ref_model,
-    prompts,
-    ground_truths,
-    train_sampling_params,
-    parallel_reward_fn,
-    args,
-):
-    """
-    Handles Stage A: Generation and Reward Calculation.
-    This function will be run in a separate thread.
-    """
-    # 1. Generate rollouts on vLLM device (e.g., cuda:1)
-    ref_outputs = ref_model.generate(
-        prompts,
-        sampling_params=train_sampling_params,
-        use_tqdm=False,
-    )
-    rollout_responses = [out.text for ref_gen in ref_outputs for out in ref_gen.outputs]
-    repeated_ground_truths = [
-        gt for gt in ground_truths for _ in range(args.group_size)
-    ]
-
-    # 2. Compute rewards on the CPU
-    advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
-        reward_fnn=parallel_reward_fn,
-        rollout_responses=rollout_responses,
-        repeated_ground_truths=repeated_ground_truths,
-        group_size=args.group_size,
-        advantage_eps=args.advantage_eps,
-        normalize_by_std=args.normalize_by_std,
-        processes=min(len(rollout_responses), args.num_proc),
-    )
-
-    # Return all the data the main training step will need
-    return ref_outputs, advantages, raw_rewards, reward_metadata
 
 
 def grpo_training(args: Namespace):
@@ -448,6 +528,13 @@ def grpo_training(args: Namespace):
         policy.gradient_checkpointing_enable()
     else:
         policy.gradient_checkpointing_disable()
+
+    # --- Optimization: torch.compile for fused kernels ---
+    if args.compile_policy:
+        policy = torch.compile(policy)
+
+    # --- Optimization: TF32 matmul on Ampere+ GPUs ---
+    torch.set_float32_matmul_precision("high")
 
     optimizer_cls = get_optimizer(args.optimizer)
     scaler = GradScaler() if args.use_scaler else None
@@ -520,35 +607,85 @@ def grpo_training(args: Namespace):
         smoothing_window=3,  # helps with RL noise
         output_dir=args.output_dir,
     )
-    # Use a thread pool with one worker for our pipeline.
-    # We queue up `prefetch_size` jobs so the worker always has work
-    # waiting, eliminating idle gaps between generation batches.
-    with ThreadPoolExecutor(max_workers=1) as executor:
+
+    def _submit_generate_and_score(
+        gen_executor: ThreadPoolExecutor,
+        score_executor: ThreadPoolExecutor,
+        samples: dict,
+    ) -> tuple[dict, Future]:
+        """
+        2-stage pipeline helper:
+        Stage 1 (gen_executor): GPU generation via vLLM
+        Stage 2 (score_executor): CPU reward scoring + tensor pre-computation
+        Returns (samples, future_for_final_result).
+        """
+
+        def _pipeline():
+            # Stage 1: generate rollouts (GPU-bound on vllm_device)
+            ref_outputs = generate_rollouts(
+                ref_model, samples["prompt"], train_sampling_params
+            )
+            # Stage 2: score + pre-tokenize (CPU-bound) — submitted to
+            # score_executor so the gen_executor is free for the next batch.
+            score_future = score_executor.submit(
+                score_rollouts,
+                ref_outputs,
+                samples["response"],
+                parallel_reward_fn,
+                tokenizer.pad_token_id,
+                args,
+            )
+            # Wait for scoring and return everything together
+            advantages, raw_rewards, reward_metadata, rollout_tensors = (
+                score_future.result()
+            )
+            return (
+                ref_outputs,
+                advantages,
+                raw_rewards,
+                reward_metadata,
+                rollout_tensors,
+            )
+
+        future = gen_executor.submit(_pipeline)
+        return samples, future
+
+    def _fill_prefetch_queue(
+        train_iterator,
+        prefetch_queue: deque,
+        gen_executor: ThreadPoolExecutor,
+        score_executor: ThreadPoolExecutor,
+        count: int,
+    ):
+        """Try to enqueue `count` batches into the prefetch queue."""
+        for _ in range(count):
+            try:
+                samples = next(train_iterator)
+                prefetch_queue.append(
+                    _submit_generate_and_score(gen_executor, score_executor, samples)
+                )
+            except StopIteration:
+                break
+
+    # 2-stage pipeline: 1 thread for GPU generation, 1 thread for CPU scoring.
+    # We queue up `prefetch_size` jobs so the GPU always has work waiting.
+    with (
+        ThreadPoolExecutor(max_workers=1) as gen_executor,
+        ThreadPoolExecutor(max_workers=1) as score_executor,
+    ):
         progress_bar = tqdm(total=total_steps, desc="GRPO Training")
         for i in range(args.epochs):
             train_iterator = iter(train_dataset.iter(batch_size=micro_train_batch_size))
 
             # -- Pipeline Kickstart: fill the prefetch queue --
-            prefetch_queue: deque[tuple[dict, object]] = deque()
-            for _ in range(args.prefetch_size):
-                try:
-                    samples = next(train_iterator)
-                    prefetch_queue.append(
-                        (
-                            samples,
-                            executor.submit(
-                                generate_and_compute_rewards,
-                                ref_model,
-                                samples["prompt"],
-                                samples["response"],
-                                train_sampling_params,
-                                parallel_reward_fn,
-                                args,
-                            ),
-                        )
-                    )
-                except StopIteration:
-                    break
+            prefetch_queue: deque[tuple[dict, Future]] = deque()
+            _fill_prefetch_queue(
+                train_iterator,
+                prefetch_queue,
+                gen_executor,
+                score_executor,
+                args.prefetch_size,
+            )
 
             for j in range(train_step_per_epoch):
                 step = i * train_step_per_epoch + j + 1
@@ -558,42 +695,37 @@ def grpo_training(args: Namespace):
 
                 # -- Pop the oldest prefetched result --
                 current_samples, future = prefetch_queue.popleft()
-                ref_outputs, advantages, raw_rewards, reward_metadata = future.result()
+                (
+                    ref_outputs,
+                    advantages,
+                    raw_rewards,
+                    reward_metadata,
+                    rollout_tensors,
+                ) = future.result()
 
                 # -- Refill: enqueue the next batch to keep the queue full --
-                try:
-                    next_samples = next(train_iterator)
-                    prefetch_queue.append(
-                        (
-                            next_samples,
-                            executor.submit(
-                                generate_and_compute_rewards,
-                                ref_model,
-                                next_samples["prompt"],
-                                next_samples["response"],
-                                train_sampling_params,
-                                parallel_reward_fn,
-                                args,
-                            ),
-                        )
-                    )
-                except StopIteration:
-                    pass  # Iterator exhausted; drain remaining queue
+                _fill_prefetch_queue(
+                    train_iterator,
+                    prefetch_queue,
+                    gen_executor,
+                    score_executor,
+                    count=1,
+                )
 
-                # --- Main Training Step on cuda:0 (using the data we just received) ---
-
-                # Move rewards/advantages to the policy device
+                # --- Main Training Step on cuda:0 ---
+                # Non-blocking H2D transfers from pinned memory
+                policy_device = args.policy_device
                 if args.loss_type == "no_baseline":
-                    raw_rewards = raw_rewards.to(args.policy_device)
+                    raw_rewards = raw_rewards.to(policy_device, non_blocking=True)
                     advantages = None
                 else:
                     raw_rewards = None
-                    advantages = advantages.to(args.policy_device)
+                    advantages = advantages.to(policy_device, non_blocking=True)
 
                 if args.loss_type == "grpo_clip":
                     cliprange = args.cliprange
-                    old_log_probs = get_rollout_logprobs(ref_outputs).to(
-                        args.policy_device
+                    old_log_probs = rollout_tensors.old_log_probs.to(
+                        policy_device, non_blocking=True
                     )
                 else:
                     cliprange = None
@@ -601,15 +733,18 @@ def grpo_training(args: Namespace):
 
                 policy_log_probs = get_policy_log_probs(
                     policy,
-                    ref_outputs,
+                    rollout_tensors,
                     tokenizer.pad_token_id,
                     micro_train_batch_size,
                     args.use_liger,
                 )
 
+                response_mask = rollout_tensors.response_mask.to(
+                    policy_device, non_blocking=True
+                )
                 loss, metadata = grpo_microbatch_train_step(
                     policy_log_probs=policy_log_probs,
-                    response_mask=prepare_mask(ref_outputs, args.policy_device),
+                    response_mask=response_mask,
                     gradient_accumulation_steps=args.gradient_accumulation_steps,
                     loss_type=args.loss_type,
                     raw_rewards=raw_rewards,
@@ -625,31 +760,33 @@ def grpo_training(args: Namespace):
 
                 if step % args.gradient_accumulation_steps == 0:
                     if args.use_scaler:
-                        # Unscale gradients before clipping
                         scaler.unscale_(optimizer)
-
                         torch.nn.utils.clip_grad_norm_(
                             policy.parameters(), max_norm=args.max_grad_norm
                         )
-
-                        # scaler.step() performs the optimizer step
                         scaler.step(optimizer)
-
-                        # Update the scale for the next iteration
                         scaler.update()
                     else:
-                        # Standard gradient clipping and optimizer step without a scaler
                         torch.nn.utils.clip_grad_norm_(
                             policy.parameters(), max_norm=args.max_grad_norm
                         )
                         optimizer.step()
-
-                    # Reset gradients for the next accumulation cycle
                     optimizer.zero_grad()
 
                 if step % args.ref_sync_steps == 0:
                     tqdm.write(f"Sync ref model at step {step}")
                     load_policy_into_vllm_instance(policy, ref_model)
+                    # Drain stale prefetched futures (generated with old weights)
+                    # and resubmit with fresh weights.
+                    stale_samples = []
+                    for stale_s, stale_f in prefetch_queue:
+                        stale_f.cancel()  # best-effort cancel
+                        stale_samples.append(stale_s)
+                    prefetch_queue.clear()
+                    for s in stale_samples:
+                        prefetch_queue.append(
+                            _submit_generate_and_score(gen_executor, score_executor, s)
+                        )
 
                 if step % args.eval_step == 0:
                     tqdm.write(f"Evaluating at step {step}...")
@@ -853,6 +990,12 @@ def main():
     argparser.add_argument("--use_scaler", action="store_true")
     argparser.add_argument("--use_liger", action="store_true", default=True)
     argparser.add_argument("--enable_gradient_checkpointing", action="store_true")
+    argparser.add_argument(
+        "--compile_policy",
+        action="store_true",
+        default=False,
+        help="Wrap the policy model with torch.compile() for fused kernels (requires PyTorch 2.x)",
+    )
     argparser.add_argument("--early_stopping", action="store_true", default=True)
     argparser.add_argument("--early_stopping_metric", type=str, default="reward")
     argparser.add_argument("--early_stopping_patience", type=int, default=3)
