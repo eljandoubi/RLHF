@@ -119,6 +119,8 @@ def compute_naive_policy_gradient_loss(
     torch.Tensor Shape (batch_size, sequence_length), the per-token policy-gradient loss (to
     be aggregated across the batch and sequence dimensions in the training loop).
     """
+    if raw_rewards_or_advantages.ndim == 1:
+        raw_rewards_or_advantages = raw_rewards_or_advantages.view(-1, 1)
     return -raw_rewards_or_advantages * policy_log_probs
 
 
@@ -265,7 +267,7 @@ def grpo_microbatch_train_step(
         might want to log.
     """
     context_manager = (
-        nullcontext() if scaler is None else autocast(dtype=torch.bfloat16)
+        nullcontext() if scaler is None else autocast("cuda", dtype=torch.bfloat16)
     )
     with context_manager:
         loss, metadata = compute_policy_gradient_loss(
@@ -1078,7 +1080,7 @@ def main():
     argparser.add_argument(
         "--prefetch_size",
         type=int,
-        default=2,
+        default=32,
         help="Number of generation/reward batches to prefetch ahead of training. "
         "Higher values reduce idle time between batches at the cost of more memory "
         "and slightly staler policy weights for prefetched generations.",
