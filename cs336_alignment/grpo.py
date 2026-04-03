@@ -1,7 +1,6 @@
 from argparse import ArgumentParser, Namespace
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal
@@ -266,9 +265,11 @@ def grpo_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
         might want to log.
     """
-    context_manager = (
-        nullcontext() if scaler is None else autocast("cuda", dtype=torch.bfloat16)
-    )
+    # Use autocast with float16 if scaler is provided, otherwise use bfloat16 without scaler
+    if scaler is not None:
+        context_manager = autocast("cuda", dtype=torch.float16)
+    else:
+        context_manager = autocast("cuda", dtype=torch.bfloat16)
     with context_manager:
         loss, metadata = compute_policy_gradient_loss(
             policy_log_probs=policy_log_probs,
@@ -281,10 +282,10 @@ def grpo_microbatch_train_step(
         loss = (
             masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
         )
-    if scaler is None:
-        loss.backward()
-    else:
+    if scaler is not None:
         scaler.scale(loss).backward()
+    else:
+        loss.backward()
     return loss.detach(), metadata
 
 
