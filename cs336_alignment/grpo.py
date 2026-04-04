@@ -778,20 +778,25 @@ def grpo_training(args: Namespace):
 
                 if step % args.ref_sync_steps == 0:
                     tqdm.write(f"Sync ref model at step {step}")
-                    load_policy_into_vllm_instance(policy, ref_model)
-                    # Drain stale prefetched futures (generated with old weights)
-                    # and resubmit with fresh weights.
+                    # Wait for all in-flight prefetch jobs to finish before
+                    # touching ref_model (vLLM is not thread-safe).
                     stale_samples = []
                     for stale_s, stale_f in prefetch_queue:
-                        stale_f.cancel()  # best-effort cancel
+                        stale_f.result()  # block until done
                         stale_samples.append(stale_s)
                     prefetch_queue.clear()
+                    load_policy_into_vllm_instance(policy, ref_model)
+                    # Resubmit with fresh weights.
                     for s in stale_samples:
                         prefetch_queue.append(
                             _submit_generate_and_score(gen_executor, score_executor, s)
                         )
 
                 if step % args.eval_step == 0:
+                    # Wait for all in-flight prefetch jobs to finish
+                    # (vLLM is not thread-safe for concurrent generate calls)
+                    for _s, _f in prefetch_queue:
+                        _f.result()
                     tqdm.write(f"Evaluating at step {step}...")
                     avg_scores = SummableDict()
                     for eval_samples in tqdm(
@@ -853,6 +858,10 @@ def grpo_training(args: Namespace):
                     counter = 0
 
                 if step % args.logging_step == 0:
+                    # Wait for all in-flight prefetch jobs to finish
+                    # (vLLM is not thread-safe for concurrent generate calls)
+                    for _s, _f in prefetch_queue:
+                        _f.result()
                     log_results = log_generations(
                         model=ref_model,
                         prompts=current_samples["prompt"],
@@ -1030,7 +1039,7 @@ def main():
     argparser.add_argument(
         "--ref_sync_steps",
         type=int,
-        default=5000,
+        default=10000,
         help="Number of steps between synchronizing the reference model with the policy",
     )
     argparser.add_argument(
