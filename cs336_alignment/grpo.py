@@ -465,35 +465,36 @@ def get_policy_log_probs(
     seq_ids = rollout_tensors.seq_ids.to(device, non_blocking=True)
     attention_mask = rollout_tensors.attention_mask.to(device, non_blocking=True)
 
-    if use_liger:
-        p_outputs = policy(
-            input_ids=seq_ids[:, :-1],
-            attention_mask=attention_mask[:, :-1],
-            labels=seq_ids[:, 1:],
-            skip_logits=True,
-            reduction="none",
-        )
-        return -p_outputs.loss.reshape(seq_ids.size(0), -1)
-
     log_probs_list = []
     for i in range(0, seq_ids.size(0), micro_batch_size):
         chunk = seq_ids[i : i + micro_batch_size]
-        input_chunk = chunk[:, :-1]
-        mask_chunk = attention_mask[i : i + micro_batch_size, :-1]
-        labels_chunk = chunk[:, 1:]
+        mask_chunk = attention_mask[i : i + micro_batch_size]
 
-        logits_chunk: torch.Tensor = policy(
-            input_ids=input_chunk, attention_mask=mask_chunk
-        ).logits
+        if use_liger:
+            p_outputs = policy(
+                input_ids=chunk[:, :-1],
+                attention_mask=mask_chunk[:, :-1],
+                labels=chunk[:, 1:],
+                skip_logits=True,
+                reduction="none",
+            )
+            log_probs_list.append(-p_outputs.loss.reshape(chunk.size(0), -1))
+        else:
+            input_chunk = chunk[:, :-1]
+            labels_chunk = chunk[:, 1:]
 
-        log_probs_chunk = -F.cross_entropy(
-            logits_chunk.reshape(-1, logits_chunk.size(-1)),
-            labels_chunk.reshape(-1),
-            reduction="none",
-            ignore_index=pad_token_id,
-        ).reshape(labels_chunk.shape)
+            logits_chunk: torch.Tensor = policy(
+                input_ids=input_chunk, attention_mask=mask_chunk[:, :-1]
+            ).logits
 
-        log_probs_list.append(log_probs_chunk)
+            log_probs_chunk = -F.cross_entropy(
+                logits_chunk.reshape(-1, logits_chunk.size(-1)),
+                labels_chunk.reshape(-1),
+                reduction="none",
+                ignore_index=pad_token_id,
+            ).reshape(labels_chunk.shape)
+
+            log_probs_list.append(log_probs_chunk)
 
     all_log_probs = torch.cat(log_probs_list, dim=0)
     return all_log_probs
@@ -715,46 +716,92 @@ def grpo_training(args: Namespace):
                     count=1,
                 )
 
-                # --- Main Training Step on cuda:0 ---
-                # Non-blocking H2D transfers from pinned memory
+                # --- Fused per-chunk forward + backward (minimises peak memory) ---
                 policy_device = args.policy_device
+                seq_ids = rollout_tensors.seq_ids.to(policy_device, non_blocking=True)
+                att_mask = rollout_tensors.attention_mask.to(policy_device, non_blocking=True)
+                response_mask = rollout_tensors.response_mask.to(policy_device, non_blocking=True)
+
                 if args.loss_type == "no_baseline":
-                    raw_rewards = raw_rewards.to(policy_device, non_blocking=True)
-                    advantages = None
+                    raw_rewards_gpu = raw_rewards.to(policy_device, non_blocking=True)
+                    advantages_gpu = None
                 else:
-                    raw_rewards = None
-                    advantages = advantages.to(policy_device, non_blocking=True)
+                    raw_rewards_gpu = None
+                    advantages_gpu = advantages.to(policy_device, non_blocking=True)
 
                 if args.loss_type == "grpo_clip":
                     cliprange = args.cliprange
-                    old_log_probs = rollout_tensors.old_log_probs.to(
+                    old_log_probs_gpu = rollout_tensors.old_log_probs.to(
                         policy_device, non_blocking=True
                     )
                 else:
                     cliprange = None
-                    old_log_probs = None
+                    old_log_probs_gpu = None
 
-                policy_log_probs = get_policy_log_probs(
-                    policy,
-                    rollout_tensors,
-                    tokenizer.pad_token_id,
-                    micro_train_batch_size,
-                    args.use_liger,
-                )
+                total_size = seq_ids.size(0)
+                fwd_chunk = max(1, micro_train_batch_size)
+                if scaler is not None:
+                    amp_ctx = autocast("cuda", dtype=torch.float16)
+                else:
+                    amp_ctx = autocast("cuda", dtype=torch.bfloat16)
 
-                response_mask = rollout_tensors.response_mask.to(
-                    policy_device, non_blocking=True
-                )
-                loss, metadata = grpo_microbatch_train_step(
-                    policy_log_probs=policy_log_probs,
-                    response_mask=response_mask,
-                    gradient_accumulation_steps=args.gradient_accumulation_steps,
-                    loss_type=args.loss_type,
-                    raw_rewards=raw_rewards,
-                    advantages=advantages,
-                    old_log_probs=old_log_probs,
-                    cliprange=cliprange,
-                )
+                accumulated_loss = 0.0
+                metadata = {}
+
+                for ci in range(0, total_size, fwd_chunk):
+                    cj = min(ci + fwd_chunk, total_size)
+                    chunk_ids = seq_ids[ci:cj]
+                    chunk_att = att_mask[ci:cj]
+
+                    with amp_ctx:
+                        # Forward pass for this chunk
+                        if args.use_liger:
+                            p_out = policy(
+                                input_ids=chunk_ids[:, :-1],
+                                attention_mask=chunk_att[:, :-1],
+                                labels=chunk_ids[:, 1:],
+                                skip_logits=True,
+                                reduction="none",
+                            )
+                            chunk_log_probs = -p_out.loss.reshape(cj - ci, -1)
+                        else:
+                            logits = policy(
+                                input_ids=chunk_ids[:, :-1],
+                                attention_mask=chunk_att[:, :-1],
+                            ).logits
+                            chunk_log_probs = -F.cross_entropy(
+                                logits.reshape(-1, logits.size(-1)),
+                                chunk_ids[:, 1:].reshape(-1),
+                                reduction="none",
+                                ignore_index=tokenizer.pad_token_id,
+                            ).reshape(cj - ci, -1)
+
+                        # Loss for this chunk
+                        chunk_loss, chunk_meta = compute_policy_gradient_loss(
+                            policy_log_probs=chunk_log_probs,
+                            loss_type=args.loss_type,
+                            raw_rewards=raw_rewards_gpu[ci:cj] if raw_rewards_gpu is not None else None,
+                            advantages=advantages_gpu[ci:cj] if advantages_gpu is not None else None,
+                            old_log_probs=old_log_probs_gpu[ci:cj] if old_log_probs_gpu is not None else None,
+                            cliprange=cliprange,
+                        )
+                        chunk_resp_mask = response_mask[ci:cj]
+                        # Use .sum() so that chunks add up to the correct full-batch mean
+                        scalar_loss = (
+                            masked_mean(chunk_loss, chunk_resp_mask, dim=1).sum()
+                            / (total_size * args.gradient_accumulation_steps)
+                        )
+
+                    # Backward for this chunk — graph is freed immediately
+                    if scaler is not None:
+                        scaler.scale(scalar_loss).backward()
+                    else:
+                        scalar_loss.backward()
+
+                    accumulated_loss += scalar_loss.detach().item()
+                    metadata = chunk_meta
+
+                loss = torch.tensor(accumulated_loss)
                 metadata.update(reward_metadata)
                 mean_metadata += metadata
                 counter += 1
