@@ -1,3 +1,4 @@
+import gc
 from argparse import ArgumentParser, Namespace
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -7,7 +8,6 @@ from typing import Callable, Literal
 
 import torch
 import wandb
-from accelerate.utils.memory import clear_device_cache
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
@@ -719,8 +719,12 @@ def grpo_training(args: Namespace):
                 # --- Fused per-chunk forward + backward (minimises peak memory) ---
                 policy_device = args.policy_device
                 seq_ids = rollout_tensors.seq_ids.to(policy_device, non_blocking=True)
-                att_mask = rollout_tensors.attention_mask.to(policy_device, non_blocking=True)
-                response_mask = rollout_tensors.response_mask.to(policy_device, non_blocking=True)
+                att_mask = rollout_tensors.attention_mask.to(
+                    policy_device, non_blocking=True
+                )
+                response_mask = rollout_tensors.response_mask.to(
+                    policy_device, non_blocking=True
+                )
 
                 if args.loss_type == "no_baseline":
                     raw_rewards_gpu = raw_rewards.to(policy_device, non_blocking=True)
@@ -780,17 +784,22 @@ def grpo_training(args: Namespace):
                         chunk_loss, chunk_meta = compute_policy_gradient_loss(
                             policy_log_probs=chunk_log_probs,
                             loss_type=args.loss_type,
-                            raw_rewards=raw_rewards_gpu[ci:cj] if raw_rewards_gpu is not None else None,
-                            advantages=advantages_gpu[ci:cj] if advantages_gpu is not None else None,
-                            old_log_probs=old_log_probs_gpu[ci:cj] if old_log_probs_gpu is not None else None,
+                            raw_rewards=raw_rewards_gpu[ci:cj]
+                            if raw_rewards_gpu is not None
+                            else None,
+                            advantages=advantages_gpu[ci:cj]
+                            if advantages_gpu is not None
+                            else None,
+                            old_log_probs=old_log_probs_gpu[ci:cj]
+                            if old_log_probs_gpu is not None
+                            else None,
                             cliprange=cliprange,
                         )
                         chunk_resp_mask = response_mask[ci:cj]
                         # Use .sum() so that chunks add up to the correct full-batch mean
-                        scalar_loss = (
-                            masked_mean(chunk_loss, chunk_resp_mask, dim=1).sum()
-                            / (total_size * args.gradient_accumulation_steps)
-                        )
+                        scalar_loss = masked_mean(
+                            chunk_loss, chunk_resp_mask, dim=1
+                        ).sum() / (total_size * args.gradient_accumulation_steps)
 
                     # Backward for this chunk — graph is freed immediately
                     if scaler is not None:
@@ -832,7 +841,12 @@ def grpo_training(args: Namespace):
                         stale_f.result()  # block until done
                         stale_samples.append(stale_s)
                     prefetch_queue.clear()
+                    # Ensure all pending CUDA ops on both devices are finished
+                    # before and after the cross-device weight copy.
+                    torch.cuda.synchronize(args.policy_device)
+                    torch.cuda.synchronize(args.vllm_device)
                     load_policy_into_vllm_instance(policy, ref_model)
+                    torch.cuda.synchronize(args.vllm_device)
                     # Resubmit with fresh weights.
                     for s in stale_samples:
                         prefetch_queue.append(
@@ -895,7 +909,12 @@ def grpo_training(args: Namespace):
                         return
 
                 if step % args.metadata_wandb_log_step == 0:
-                    clear_device_cache(garbage_collection=True)
+                    # Drain prefetch queue so no vLLM generation is in-flight,
+                    # then clear cache only on the policy device (cuda:0).
+                    for _s, _f in prefetch_queue:
+                        _f.result()
+                    gc.collect()
+                    torch.cuda.empty_cache()
                     mean_metadata = mean_metadata / counter
                     tqdm.write(f"Step {step} metadata: {mean_metadata}")
                     wandb.log(
@@ -1000,7 +1019,7 @@ def main():
     argparser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=128,
+        default=64,
         help="Number of microbatches to accumulate before each optimizer step",
     )
     argparser.add_argument(
