@@ -743,7 +743,7 @@ def grpo_training(args: Namespace):
                     old_log_probs_gpu = None
 
                 total_size = seq_ids.size(0)
-                fwd_chunk = max(1, micro_train_batch_size)
+                fwd_chunk = total_size if args.use_liger else max(1, micro_train_batch_size)
                 if scaler is not None:
                     amp_ctx = autocast("cuda", dtype=torch.float16)
                 else:
