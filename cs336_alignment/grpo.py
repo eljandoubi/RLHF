@@ -9,7 +9,6 @@ from typing import Callable, Literal
 import torch
 import wandb
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
-from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from tqdm import tqdm
 from transformers import (
@@ -243,7 +242,6 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
-    scaler: GradScaler | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Execute a forward-and-backward pass on a microbatch.
@@ -265,27 +263,17 @@ def grpo_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
         might want to log.
     """
-    # Use autocast with float16 if scaler is provided, otherwise use bfloat16 without scaler
-    if scaler is not None:
-        context_manager = autocast("cuda", dtype=torch.float16)
-    else:
-        context_manager = autocast("cuda", dtype=torch.bfloat16)
-    with context_manager:
-        loss, metadata = compute_policy_gradient_loss(
-            policy_log_probs=policy_log_probs,
-            loss_type=loss_type,
-            raw_rewards=raw_rewards,
-            advantages=advantages,
-            old_log_probs=old_log_probs,
-            cliprange=cliprange,
-        )
-        loss = (
-            masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
-        )
-    if scaler is not None:
-        scaler.scale(loss).backward()
-    else:
-        loss.backward()
+    # Standard float32 training, no mixed precision
+    loss, metadata = compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
+    loss = masked_mean(loss, response_mask, dim=1).mean() / gradient_accumulation_steps
+    loss.backward()
     return loss.detach(), metadata
 
 
@@ -541,7 +529,7 @@ def grpo_training(args: Namespace):
     torch.set_float32_matmul_precision("high")
 
     optimizer_cls = get_optimizer(args.optimizer)
-    scaler = GradScaler() if args.use_scaler else None
+    # No mixed precision
     optimizer: torch.optim.Optimizer = optimizer_cls(
         policy.parameters(), lr=args.learning_rate, weight_decay=0.0, betas=(0.9, 0.95)
     )
@@ -743,12 +731,9 @@ def grpo_training(args: Namespace):
                     old_log_probs_gpu = None
 
                 total_size = seq_ids.size(0)
-                fwd_chunk = total_size if args.use_liger else max(1, micro_train_batch_size)
-                if scaler is not None:
-                    amp_ctx = autocast("cuda", dtype=torch.float16)
-                else:
-                    amp_ctx = autocast("cuda", dtype=torch.bfloat16)
-
+                fwd_chunk = (
+                    total_size if args.use_liger else max(1, micro_train_batch_size)
+                )
                 accumulated_loss = 0.0
                 metadata = {}
 
@@ -757,55 +742,51 @@ def grpo_training(args: Namespace):
                     chunk_ids = seq_ids[ci:cj]
                     chunk_att = att_mask[ci:cj]
 
-                    with amp_ctx:
-                        # Forward pass for this chunk
-                        if args.use_liger:
-                            p_out = policy(
-                                input_ids=chunk_ids[:, :-1],
-                                attention_mask=chunk_att[:, :-1],
-                                labels=chunk_ids[:, 1:],
-                                skip_logits=True,
-                                reduction="none",
-                            )
-                            chunk_log_probs = -p_out.loss.reshape(cj - ci, -1)
-                        else:
-                            logits = policy(
-                                input_ids=chunk_ids[:, :-1],
-                                attention_mask=chunk_att[:, :-1],
-                            ).logits
-                            chunk_log_probs = -F.cross_entropy(
-                                logits.reshape(-1, logits.size(-1)),
-                                chunk_ids[:, 1:].reshape(-1),
-                                reduction="none",
-                                ignore_index=tokenizer.pad_token_id,
-                            ).reshape(cj - ci, -1)
-
-                        # Loss for this chunk
-                        chunk_loss, chunk_meta = compute_policy_gradient_loss(
-                            policy_log_probs=chunk_log_probs,
-                            loss_type=args.loss_type,
-                            raw_rewards=raw_rewards_gpu[ci:cj]
-                            if raw_rewards_gpu is not None
-                            else None,
-                            advantages=advantages_gpu[ci:cj]
-                            if advantages_gpu is not None
-                            else None,
-                            old_log_probs=old_log_probs_gpu[ci:cj]
-                            if old_log_probs_gpu is not None
-                            else None,
-                            cliprange=cliprange,
+                    # Forward pass for this chunk
+                    if args.use_liger:
+                        p_out = policy(
+                            input_ids=chunk_ids[:, :-1],
+                            attention_mask=chunk_att[:, :-1],
+                            labels=chunk_ids[:, 1:],
+                            skip_logits=True,
+                            reduction="none",
                         )
-                        chunk_resp_mask = response_mask[ci:cj]
-                        # Use .sum() so that chunks add up to the correct full-batch mean
-                        scalar_loss = masked_mean(
-                            chunk_loss, chunk_resp_mask, dim=1
-                        ).sum() / (total_size * args.gradient_accumulation_steps)
+                        chunk_log_probs = -p_out.loss.reshape(cj - ci, -1)
+                    else:
+                        logits = policy(
+                            input_ids=chunk_ids[:, :-1],
+                            attention_mask=chunk_att[:, :-1],
+                        ).logits
+                        chunk_log_probs = -F.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)),
+                            chunk_ids[:, 1:].reshape(-1),
+                            reduction="none",
+                            ignore_index=tokenizer.pad_token_id,
+                        ).reshape(cj - ci, -1)
+
+                    # Loss for this chunk
+                    chunk_loss, chunk_meta = compute_policy_gradient_loss(
+                        policy_log_probs=chunk_log_probs,
+                        loss_type=args.loss_type,
+                        raw_rewards=raw_rewards_gpu[ci:cj]
+                        if raw_rewards_gpu is not None
+                        else None,
+                        advantages=advantages_gpu[ci:cj]
+                        if advantages_gpu is not None
+                        else None,
+                        old_log_probs=old_log_probs_gpu[ci:cj]
+                        if old_log_probs_gpu is not None
+                        else None,
+                        cliprange=cliprange,
+                    )
+                    chunk_resp_mask = response_mask[ci:cj]
+                    # Use .sum() so that chunks add up to the correct full-batch mean
+                    scalar_loss = masked_mean(
+                        chunk_loss, chunk_resp_mask, dim=1
+                    ).sum() / (total_size * args.gradient_accumulation_steps)
 
                     # Backward for this chunk — graph is freed immediately
-                    if scaler is not None:
-                        scaler.scale(scalar_loss).backward()
-                    else:
-                        scalar_loss.backward()
+                    scalar_loss.backward()
 
                     accumulated_loss += scalar_loss.detach().item()
                     metadata = chunk_meta
@@ -818,18 +799,10 @@ def grpo_training(args: Namespace):
                 progress_bar.update(1)
 
                 if step % args.gradient_accumulation_steps == 0:
-                    if args.use_scaler:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            policy.parameters(), max_norm=args.max_grad_norm
-                        )
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(
-                            policy.parameters(), max_norm=args.max_grad_norm
-                        )
-                        optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(
+                        policy.parameters(), max_norm=args.max_grad_norm
+                    )
+                    optimizer.step()
                     optimizer.zero_grad()
 
                 if step % args.ref_sync_steps == 0:
@@ -1065,7 +1038,7 @@ def main():
         default=True,
         help="Whether to normalize rewards by the per-group standard deviation (in addition to subtracting the mean)",
     )
-    argparser.add_argument("--use_scaler", action="store_true")
+    # Removed --use_scaler argument (no mixed precision)
     argparser.add_argument("--use_liger", action="store_true", default=True)
     argparser.add_argument("--enable_gradient_checkpointing", action="store_true")
     argparser.add_argument(
